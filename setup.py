@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="chemistryai",
-    version="0.1.0",
+    version="0.1.4",
     packages=find_packages(),
     install_requires=[
         "rdkit-pypi",
@@ -20,3 +20,4 @@ setup(
         "Operating System :: OS Independent",
     ],
 )
+
