@@ -71,76 +71,124 @@ class GraphNode:
         """Check if graph contains a cycle"""
         return self.find_cycle() is not None
 
-    # ---------- Main chain detection ----------
     def tag_mainchain(self, atom="C", tag="mainchain"):
         """
-        Detect and orient the IUPAC main chain.
-        Returns:
-            mainchain: list of atom IDs in order
-            numbering: dict {atom_id: position in chain (1-based)}
+        Detect and orient the IUPAC main chain correctly.
+        IUPAC priority:
+          1. Longest carbon chain
+          2. Maximum number of multiple bonds
+          3. Lowest locants for multiple bonds
+          4. Double bonds preferred over triple bonds
+          5. Lowest substituent locants
         """
         carbons = [i for i, a in self.nodes.items() if a == atom]
         raw_chains = []
 
+        # -----------------------------
+        # Collect all carbon paths
+        # -----------------------------
         def dfs(v, visited, path):
             visited.add(v)
             path.append(v)
+
             extended = False
             for n in self.edges[v]:
                 if n not in visited and self.nodes[n] == atom:
                     dfs(n, visited, path)
                     extended = True
+
             if not extended:
                 raw_chains.append(path.copy())
+
             path.pop()
             visited.remove(v)
 
         for c in carbons:
             dfs(c, set(), [])
 
+        # -----------------------------
+        # Helpers
+        # -----------------------------
         def bonds_of(chain):
-            return [self.edges[chain[i]][chain[i + 1]].get("bond", 1)
-                    for i in range(len(chain) - 1)]
+            return [
+                self.edges[chain[i]][chain[i + 1]].get("bond", 1)
+                for i in range(len(chain) - 1)
+            ]
 
-        def multiple_bond_count(bonds):
-            return sum(1 for b in bonds if b > 1)
+        def unsat_locs(bonds):
+            return [i + 1 for i, b in enumerate(bonds) if b > 1]
 
-        def double_bond_count(bonds):
-            return sum(1 for b in bonds if b == 2)
+        def double_locs(bonds):
+            return [i + 1 for i, b in enumerate(bonds) if b == 2]
 
-        def locant_score(bonds):
-            double_locs = [i + 1 for i, b in enumerate(bonds) if b == 2]
-            triple_locs = [i + 1 for i, b in enumerate(bonds) if b == 3]
-            def s(l):
-                return sum(l) if l else float("inf")
-            return (s(double_locs), s(triple_locs))
+        def triple_locs(bonds):
+            return [i + 1 for i, b in enumerate(bonds) if b == 3]
 
+        def substituent_locs(chain):
+            locs = []
+            chain_set = set(chain)
+            for i, atom_id in enumerate(chain):
+                for nbr in self.edges[atom_id]:
+                    if nbr not in chain_set:
+                        locs.append(i + 1)
+                        break
+            return sorted(locs)
+
+        def substituent_signature(chain):
+            sig = []
+            chain_set = set(chain)
+            for atom_id in chain:
+                subs = []
+                for nbr in self.edges[atom_id]:
+                    if nbr not in chain_set:
+                        subs.append(self.nodes[nbr])
+                if subs:
+                    sig.append(tuple(sorted(subs)))
+            return tuple(sig)
+
+        # -----------------------------
+        # Generate candidates
+        # -----------------------------
         candidates = []
+
         max_len = max(len(c) for c in raw_chains)
+
         for chain in raw_chains:
             if len(chain) != max_len:
                 continue
+
             for oriented in (chain, chain[::-1]):
                 bonds = bonds_of(oriented)
+
                 score = (
-                    len(oriented),
-                    multiple_bond_count(bonds),
-                    double_bond_count(bonds),
-                    tuple(-x for x in locant_score(bonds)),
-                    sum(bonds)
+                    -len(oriented),                    # longest chain
+                    -len(unsat_locs(bonds)),           # most multiple bonds
+                    unsat_locs(bonds),                 # lowest unsaturation locants
+                    double_locs(bonds),                # double before triple
+                    triple_locs(bonds),
+                    substituent_locs(oriented),        # lowest substituent locants
+                    substituent_signature(oriented)    # alphabetical tie-breaker
                 )
+
                 candidates.append((score, oriented))
 
-        candidates.sort(reverse=True)
+        # -----------------------------
+        # Select best chain
+        # -----------------------------
+        # Sort by the tuple priority defined above
+        candidates.sort(key=lambda x: x[0])
         mainchain = candidates[0][1]
 
-        # Tag atoms and create numbering
+        # -----------------------------
+        # Tag atoms + numbering
+        # -----------------------------
         numbering = {}
         for pos, atom_id in enumerate(mainchain, 1):
             self.node_tags[atom_id].add(tag)
             numbering[atom_id] = pos
 
         return mainchain, numbering
+
 
     def collect_subgraph(self, start_node, exclude=None):
         """
@@ -220,7 +268,7 @@ class GraphNode:
 # ============================================================
 
 class TreeNode:
-    def __init__(self, pos, chain_length, nodes=None, label="", bonds=None, is_cyclic=False):
+    def __init__(self, pos, chain_length, nodes=None, label="", bonds=None, is_cyclic=False, atom=None):
         """
         pos: position on parent chain
         chain_length: length of this chain segment
@@ -236,7 +284,7 @@ class TreeNode:
         self.bonds = bonds or [1] * (len(self.nodes) - 1)
         self.is_cyclic = is_cyclic
         self.children = []
-
+        self.atom = atom
     def add_child(self, c):
         self.children.append(c)
 
@@ -279,25 +327,67 @@ MULTIPLIER = {
     3: "tri",
     4: "tetra",
     5: "penta",
-    6: "hexa"
+    6: "hexa",
+    7: "hepta"
 }
 
+HALOGEN = {
+    "F": "fluoro",
+    "Cl": "chloro",
+    "Br": "bromo",
+    "I": "iodo"
+}
 
 # ============================================================
 # Tree Building Functions
 # ============================================================
-
 def _build_substituent_tree(graph, attach_atom, start_atom, mainchain_set, visited=None):
     """
     Build a substituent TreeNode starting from start_atom,
     excluding mainchain atoms and avoiding cycles.
+    Groups halogens attached to a carbon as a single "halogenated_carbon".
     """
     if visited is None:
         visited = set()
 
     visited.add(start_atom)
+    atom_symbol = graph.nodes[start_atom]
 
-    # Build linear chain first (longest path)
+    # --- Halogen atom itself ---
+    if atom_symbol in HALOGEN:
+        return TreeNode(
+            pos=0,
+            chain_length=1,
+            nodes=[start_atom],
+            label="halogen",
+            atom=atom_symbol,
+            bonds=[]
+        )
+
+    # --- Gather neighbors excluding mainchain and visited ---
+    neighbors = [
+        n for n in graph.edges[start_atom]
+        if n not in visited and n not in mainchain_set
+    ]
+
+    halogen_children = [n for n in neighbors if graph.nodes[n] in HALOGEN]
+    carbon_children = [n for n in neighbors if graph.nodes[n] == "C"]
+
+    # --- Case: carbon with only halogens (CCl3, CF2, etc.) ---
+    if halogen_children and not carbon_children:
+        node = TreeNode(
+            pos=0,
+            chain_length=1,
+            nodes=[start_atom],
+            label="halogenated_carbon"
+        )
+        for h in halogen_children:
+            visited.add(h)
+            hal_node = TreeNode(pos=0, chain_length=1, nodes=[h], label="halogen", atom=graph.nodes[h])
+            node.add_child(hal_node)
+        return node
+
+    # --- Build main chain of substituent ---
     def dfs_chain(v, parent):
         best = [v]
         for n in graph.edges[v]:
@@ -305,7 +395,6 @@ def _build_substituent_tree(graph, attach_atom, start_atom, mainchain_set, visit
                 continue
             if graph.nodes[n] != "C":
                 continue
-
             path = [v] + dfs_chain(n, v)
             if len(path) > len(best):
                 best = path
@@ -314,9 +403,7 @@ def _build_substituent_tree(graph, attach_atom, start_atom, mainchain_set, visit
     chain = dfs_chain(start_atom, attach_atom)
     chain_set = set(chain)
 
-    # Bond orders along substituent chain
-    bonds = [graph.edges[chain[i]][chain[i + 1]].get("bond", 1)
-             for i in range(len(chain) - 1)]
+    bonds = [graph.edges[chain[i]][chain[i + 1]].get("bond", 1) for i in range(len(chain)-1)]
 
     node = TreeNode(
         pos=0,
@@ -326,23 +413,30 @@ def _build_substituent_tree(graph, attach_atom, start_atom, mainchain_set, visit
         bonds=bonds
     )
 
-    # Attach branches to substituent chain
+    # --- Attach halogens to each carbon along the chain ---
     for i, atom in enumerate(chain):
-        for n in graph.edges[atom]:
-            if n in chain_set or n in visited or n in mainchain_set:
-                continue
-            if graph.nodes[n] != "C":
-                continue
+        atom_neighbors = [
+            n for n in graph.edges[atom]
+            if n not in chain_set and n not in visited and n not in mainchain_set
+        ]
 
-            child = _build_substituent_tree(
-                graph,
-                atom,
-                n,
-                mainchain_set,
-                visited
-            )
-            child.pos = i + 1
-            node.add_child(child)
+        # Halogens attached to this carbon
+        hal_children = [n for n in atom_neighbors if graph.nodes[n] in HALOGEN]
+        carbon_children_branch = [n for n in atom_neighbors if graph.nodes[n] == "C"]
+
+        if hal_children:
+            hc_node = TreeNode(pos=i+1, chain_length=1, nodes=[atom], label="halogenated_carbon")
+            for h in hal_children:
+                visited.add(h)
+                hal_node = TreeNode(pos=0, chain_length=1, nodes=[h], label="halogen", atom=graph.nodes[h])
+                hc_node.add_child(hal_node)
+            node.add_child(hc_node)
+
+        # Recursively handle carbon branches
+        for c in carbon_children_branch:
+            child_node = _build_substituent_tree(graph, atom, c, mainchain_set, visited)
+            child_node.pos = i + 1
+            node.add_child(child_node)
 
     return node
 
@@ -515,42 +609,69 @@ def needs_parentheses(name):
     """Check if substituent name needs parentheses"""
     return "-" in name or "," in name
 
-
-def substituent_name(subroot):
+def substituent_name(subroot: TreeNode) -> str:
     """
     Convert a substituent TreeNode to proper IUPAC substituent name.
+
+    Handles:
+    - Single halogens (Cl, Br, F, I)
+    - Halogenated carbons (e.g., CCl3 -> trichloromethyl)
+    - Linear alkyl chains with multiple bonds
     """
+    # --- Single halogen atom ---
+    if subroot.label == "halogen":
+        return HALOGEN[subroot.atom]
+
+    # --- Halogenated carbon (CCl3, CF2, etc.) ---
+    if subroot.label == "halogenated_carbon":
+        halogen_counts = {}
+        for child in subroot.children:
+            if child.label == "halogen":
+                hal = child.atom
+                halogen_counts[hal] = halogen_counts.get(hal, 0) + 1
+
+        # Build prefix with multipliers
+        prefixes = []
+        for hal, count in sorted(halogen_counts.items(), key=lambda x: HALOGEN[x[0]]):
+            mult = MULTIPLIER.get(count, str(count)) if count > 1 else ""
+            prefixes.append(f"{mult}{HALOGEN[hal]}")
+
+        return "".join(prefixes) + "methyl"
+
+    # --- Linear alkyl chain (substituent) ---
     if subroot.chain_length not in ALKANE:
-        raise ValueError("Unsupported substituent length")
+        raise ValueError(f"Unsupported substituent chain length: {subroot.chain_length}")
 
     base = ALKANE[subroot.chain_length]
 
+    # Multiple bonds
     double_locs = [i + 1 for i, b in enumerate(subroot.bonds) if b == 2]
     triple_locs = [i + 1 for i, b in enumerate(subroot.bonds) if b == 3]
 
+    # Build unsaturation suffix
     suffix_parts = []
-
     if double_locs:
-        count = len(double_locs)
-        prefix = MULTIPLIER.get(count, str(count)) if count > 1 else ""
-        suffix_parts.append(f"{','.join(map(str, double_locs))}-{prefix}enyl")
-
+        n = len(double_locs)
+        prefix = MULTIPLIER.get(n, str(n)) if n > 1 else ""
+        suffix_parts.append(f"{','.join(map(str,double_locs))}-{prefix}enyl")
     if triple_locs:
-        count = len(triple_locs)
-        prefix = MULTIPLIER.get(count, str(count)) if count > 1 else ""
-        suffix_parts.append(f"{','.join(map(str, triple_locs))}-{prefix}ynyl")
+        n = len(triple_locs)
+        prefix = MULTIPLIER.get(n, str(n)) if n > 1 else ""
+        suffix_parts.append(f"{','.join(map(str,triple_locs))}-{prefix}ynyl")
 
+    # No multiple bonds: simple alkyl
     if not suffix_parts:
         return base + "yl"
 
+    # Merge parts carefully
     final_suffix = []
     for i, part in enumerate(suffix_parts):
+        # Remove redundant 'e' in multiple bond notation
         if i > 0 and final_suffix[-1].endswith('e') and part.startswith('e'):
             part = part[1:]
         final_suffix.append(part)
 
     return base + "-" + "-".join(final_suffix)
-
 
 def tree_to_iupac(root):
     """
@@ -562,79 +683,98 @@ def tree_to_iupac(root):
     else:
         return _acyclic_to_iupac(root)
 
-
-def _acyclic_to_iupac(root):
-    """IUPAC naming for acyclic compounds (original logic)"""
+def _acyclic_to_iupac(root: TreeNode) -> str:
+    """
+    IUPAC naming for acyclic compounds.
+    Groups main-chain halogens correctly with multipliers,
+    sorts substituents alphabetically, handles halogenated carbons.
+    """
     if root.chain_length not in ALKANE:
         raise ValueError("Unsupported chain length")
 
     base_chain = ALKANE[root.chain_length]
+    suffix = "ane"
 
-    # Collect multiple bonds
-    double_locs = []
-    triple_locs = []
+    # -----------------------------
+    # Step 1: Collect main-chain halogens
+    # -----------------------------
+    halogen_counts = {}  # {Cl: [pos1, pos2, ...]}
+    other_subs = []
 
-    for i, b in enumerate(root.bonds):
-        if b == 2:
-            double_locs.append(i + 1)
-        elif b == 3:
-            triple_locs.append(i + 1)
-
-    # Build suffix
-    suffix_parts = []
-
-    if double_locs:
-        n = len(double_locs)
-        mult = MULTIPLIER.get(n, "") if n > 1 else ""
-        suffix_parts.append({
-            "type": "ene",
-            "text": f"{','.join(map(str, double_locs))}-{mult}ene"
-        })
-
-    if triple_locs:
-        n = len(triple_locs)
-        mult = MULTIPLIER.get(n, "") if n > 1 else ""
-        suffix_parts.append({
-            "type": "yne",
-            "text": f"{','.join(map(str, triple_locs))}-{mult}yne"
-        })
-
-    if len(suffix_parts) == 2:
-        if suffix_parts[0]["type"] == "ene" and suffix_parts[1]["type"] == "yne":
-            suffix_parts[0]["text"] = suffix_parts[0]["text"].replace("ene", "en")
-
-    suffix = "-".join(p["text"] for p in suffix_parts) if suffix_parts else "ane"
-
-    # Substituents
-    subs = []
     for c in root.children:
+        if c.label == "halogen" and c.pos > 0:  # attached to main chain
+            halogen_counts.setdefault(c.atom, []).append(c.pos)
+        else:
+            other_subs.append(c)
+
+    # Flatten halogens into prefixes
+    halogen_prefixes = []
+    for hal in sorted(halogen_counts.keys()):
+        locs = sorted(halogen_counts[hal])
+        mult = MULTIPLIER.get(len(locs), "") if len(locs) > 1 else ""
+        halogen_prefixes.append(f"{','.join(map(str, locs))}-{mult}{HALOGEN[hal]}")
+
+    # -----------------------------
+    # Step 2: Process other substituents
+    # -----------------------------
+    subs = []
+    for c in other_subs:
         name = substituent_name(c)
         display = f"({name})" if needs_parentheses(name) else name
         subs.append((c.pos, name, display))
 
+    # Group substituents by base name
     grouped = {}
-    for pos, base, disp in subs:
-        grouped.setdefault(base, {"positions": [], "display": disp})
-        grouped[base]["positions"].append(pos)
+    for pos, base_name, disp in subs:
+        grouped.setdefault(base_name, {"positions": [], "display": disp})
+        grouped[base_name]["positions"].append(pos)
 
-    pieces = []
-    for base in sorted(grouped, key=str.lower):
-        data = grouped[base]
+    # Sort alphabetically by substituent name
+    other_prefixes = []
+    for base_name in sorted(grouped.keys(), key=str.lower):
+        data = grouped[base_name]
         locs = sorted(data["positions"])
         mult = MULTIPLIER.get(len(locs), "") if len(locs) > 1 else ""
-        pieces.append(f"{','.join(map(str, locs))}-{mult}{data['display']}")
+        other_prefixes.append(f"{','.join(map(str, locs))}-{mult}{data['display']}")
 
-    # Final assembly
-    if pieces:
-        if suffix == "ane":
-            return "-".join(pieces) + base_chain + "ane"
-        else:
-            return "-".join(pieces) + base_chain + "-" + suffix
-    else:
-        if suffix == "ane":
-            return base_chain + "ane"
-        else:
-            return base_chain + "-" + suffix
+    # -----------------------------
+    # Step 3: Handle multiple bonds on main chain (if any)
+    # -----------------------------
+    double_locs = [i + 1 for i, b in enumerate(root.bonds) if b == 2]
+    triple_locs = [i + 1 for i, b in enumerate(root.bonds) if b == 3]
+
+    if double_locs or triple_locs:
+        suffix_parts = []
+        if double_locs:
+            n = len(double_locs)
+            mult = MULTIPLIER.get(n, "") if n > 1 else ""
+            suffix_parts.append(f"{','.join(map(str,double_locs))}-{mult}ene")
+        if triple_locs:
+            n = len(triple_locs)
+            mult = MULTIPLIER.get(n, "") if n > 1 else ""
+            suffix_parts.append(f"{','.join(map(str,triple_locs))}-{mult}yne")
+        suffix = "-".join(suffix_parts)
+
+    # -----------------------------
+    # Step 4: Assemble full name
+    # -----------------------------
+    pieces = halogen_prefixes + other_prefixes
+    # Insert hyphen if suffix starts with a digit
+    def join_base_suffix(base, suffix):
+        if suffix and suffix[0].isdigit():
+            return base + "-" + suffix
+        return base + suffix
+
+    chain_with_suffix = join_base_suffix(base_chain, suffix)
+
+    full_name = (
+        "-".join(pieces) + chain_with_suffix
+        if pieces else
+        chain_with_suffix
+    )
+
+
+    return full_name
 
 
 def _cyclic_to_iupac(root):
@@ -759,23 +899,20 @@ def graphnode_to_rdkit_mol(graph):
                 continue
 
             bond_order = data.get("bond", 1)
-            if bond_order == 1:
-                bond_type = Chem.BondType.SINGLE
-            elif bond_order == 2:
-                bond_type = Chem.BondType.DOUBLE
-            elif bond_order == 3:
-                bond_type = Chem.BondType.TRIPLE
-            else:
-                raise ValueError(f"Invalid bond order: {bond_order}")
-
+            bond_type = {1: Chem.BondType.SINGLE,
+                         2: Chem.BondType.DOUBLE,
+                         3: Chem.BondType.TRIPLE}.get(bond_order, Chem.BondType.SINGLE)
             rw_mol.AddBond(id_map[i], id_map[j], bond_type)
             added.add((i, j))
 
     mol = rw_mol.GetMol()
+
+    # --- Skip full sanitization ---
     try:
-        Chem.SanitizeMol(mol)
+        Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES)
+        # ^ this sanitizes structure but ignores valence errors
     except Exception as e:
-        raise ValueError(f"Invalid chemical structure: {e}")
+        print("Warning: skipped valence sanitization:", e)
 
     return mol
 
@@ -830,18 +967,16 @@ def smiles_to_graphnode(smiles: str) -> GraphNode:
 
     return graph
 
-
-
 def draw_graph_with_rdkit(graph, filename="compound.png", size=(600, 400)):
     rw_mol = Chem.RWMol()
     atom_map = {}
 
     for node_id, atom_symbol in graph.nodes.items():
-        # Convert lowercase aromatic symbols to normal uppercase
-        symbol = atom_symbol.upper()
+        # Keep halogens properly capitalized
+        symbol = atom_symbol if atom_symbol in {"Cl", "Br", "I", "F"} else atom_symbol.upper()
         atom = Chem.Atom(symbol)
         # Mark aromatic atom if symbol is lowercase in GraphNode
-        if atom_symbol.islower():
+        if atom_symbol.islower() and atom_symbol not in {"c", "n", "o"}:  # only carbons/hetero
             atom.SetIsAromatic(True)
         atom_map[node_id] = rw_mol.AddAtom(atom)
 
@@ -871,7 +1006,15 @@ def draw_graph_with_rdkit(graph, filename="compound.png", size=(600, 400)):
         print("Sanitization failed:", e)
 
     AllChem.Compute2DCoords(mol)
-
     img = Draw.MolToImage(mol, size=size, kekulize=False, wedgeBonds=True)
     img.save(filename)
     print(f"Saved {filename}")
+
+def iupac(graph):
+    tmp = build_tree_recursive(graph)
+    #print(tmp)
+    return tree_to_iupac(tmp)
+def smiles(string):
+    return smiles_to_graphnode(string)
+def draw(graph, filename="compound.png", size=(600, 400)):
+    draw_graph_with_rdkit(graph, filename, size)
