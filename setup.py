@@ -2,10 +2,11 @@ from setuptools import setup, find_packages
 
 setup(
     name="chemistryai",
-    version="0.1.4",
+    version="0.1.6",
     packages=find_packages(),
     install_requires=[
-        "rdkit-pypi",
+        "rdkit==2025.9.3",
+        "Pillow>=10.0.0",
     ],
     python_requires='>=3.9',
     author="education_is_self_done",
@@ -20,4 +21,3 @@ setup(
         "Operating System :: OS Independent",
     ],
 )
-
