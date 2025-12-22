@@ -205,17 +205,23 @@ class GraphNode:
     # ---------- Subgraph extraction ----------
     def subgraph(self, node_ids):
         sub = GraphNode()
+        sub.original_id = {}  # map new ID -> original ID
         m = {}
 
+        # Add nodes
         for i in node_ids:
-            m[i] = sub.add_node(self.nodes[i], self.node_tags[i])
+            new_id = sub.add_node(self.nodes[i], self.node_tags[i])
+            m[i] = new_id
+            sub.original_id[new_id] = i  # store mapping
 
+        # Add edges
         for i in node_ids:
             for j, e in self.edges[i].items():
                 if j in node_ids and m[i] < m[j]:
                     sub.add_edge(m[i], m[j], e["bond"], e["tags"])
 
         return sub
+
 
     def get_substituents(self, mainchain):
         """
@@ -256,7 +262,7 @@ class GraphNode:
 # ============================================================
 
 class TreeNode:
-    def __init__(self, pos, chain_length, nodes=None, label="", bonds=None, is_cyclic=False, atom=None):
+    def __init__(self, pos, chain_length, nodes=None, label="", bonds=None, is_cyclic=False, atom=None, exo_bond=None):
         """
         pos: position on parent chain
         chain_length: length of this chain segment
@@ -273,6 +279,7 @@ class TreeNode:
         self.is_cyclic = is_cyclic
         self.children = []
         self.atom = atom
+        self.exo_bond = exo_bond
     def add_child(self, c):
         self.children.append(c)
 
@@ -327,6 +334,15 @@ HALOGEN = {
 }
 HETERO = {
     "O": "oxy"
+}
+FUNCTIONAL_GROUP_LABELS = {
+    "carboxylic_acid",
+    "aldehyde",
+    "ketone",
+    "alcohol",
+    "cyano",
+    "nitro",
+    "halogen",
 }
 
 
@@ -431,6 +447,32 @@ def has_single_carbon_attachment_with_halogen_or_oxygen(
 
     return None
 
+def children_only_ketone_or_halogen(node: "TreeNode") -> bool:
+    """
+    Return True if all descendants (children at any depth) of `node`
+    are ketones or halogens. The node itself is NOT checked.
+    """
+
+    allowed = {
+        "ketone",
+        "halogen",
+        "fluoro",
+        "chloro",
+        "bromo",
+        "iodo",
+        "aldehyde"
+    }
+
+    for child in node.children:
+        # Check this child
+        if child.label in allowed:
+            return True
+
+        # Recursively check its children
+        if children_only_ketone_or_halogen(child):
+            return True
+
+    return False
 
 
 def build_tree_recursive(graph: GraphNode,start_atom=None) -> TreeNode:
@@ -441,6 +483,11 @@ def build_tree_recursive(graph: GraphNode,start_atom=None) -> TreeNode:
         return None  # skip this graph entirely
     cycle = graph.find_cycle()
     if cycle:
+        out2 = _build_cyclic_tree(graph, cycle, start_atom)
+        convert_carbaldehyde_nodes(out2)
+        
+        if not children_only_ketone_or_halogen(out2):
+            return out2
         out = has_single_carbon_attachment_with_halogen_or_oxygen(graph, cycle)
         if out:
             return _build_acyclic_tree(graph, out)
@@ -482,7 +529,7 @@ def _build_acyclic_tree(graph: GraphNode, start_atom=None) -> TreeNode:
     """
     Recursive version of _build_acyclic_tree.
     ALL original features preserved.
-    Alcohols (-OH) and halogens are detected and added as nodes.
+    Alcohols (-OH), halogens, and nitroso (-N=O) are detected and added as nodes.
     """
 
     # ============================================================
@@ -525,7 +572,7 @@ def _build_acyclic_tree(graph: GraphNode, start_atom=None) -> TreeNode:
                 alcohol_nodes.append((c, nbr))
 
     # ============================================================
-    # 🆕 3️⃣b Detect halogens on main chain (C–X)
+    # 3️⃣b Detect halogens on main chain (C–X)
     # ============================================================
     halogen_nodes = []
     for c in mainchain:
@@ -534,21 +581,34 @@ def _build_acyclic_tree(graph: GraphNode, start_atom=None) -> TreeNode:
                 halogen_nodes.append((c, nbr))
 
     # ============================================================
-    # 4️⃣ Temporarily remove carbonyl oxygens
+    # 🆕 3️⃣c Detect nitroso groups on main chain (C–N=O)
     # ============================================================
-    removed_nodes = []
-    removed_edges = []
 
-    for c, o in carbonyl_pairs:
-        removed_edges.append((c, o, graph.edges[c][o]))
-        removed_edges.append((o, c, graph.edges[o][c]))
+    nitro_nodes = []
+    for c in mainchain:
+        for nbr, edge in graph.edges[c].items():
+            if graph.nodes.get(nbr) == "N":
+                oxy_count = 0
+                for n2, e2 in graph.edges[nbr].items():
+                    if n2 != c and graph.nodes.get(n2) == "O" and e2.get("bond") in (1, 2):
+                        oxy_count += 1
+                if oxy_count == 2:
+                    nitro_nodes.append((c, nbr))
+    # ============================================================
+    # 🆕 3️⃣d Detect cyano groups on main chain (C–C≡N)
+    # ============================================================
+    cyano_nodes = []
+    for c in mainchain:
+        for c2, edge_cc in graph.edges[c].items():
+            if graph.nodes.get(c2) != "C" or edge_cc.get("bond") != 1:
+                continue
 
-        del graph.edges[c][o]
-        del graph.edges[o][c]
-
-        removed_nodes.append((o, graph.nodes[o]))
-        del graph.nodes[o]
-        del graph.edges[o]
+            # Check for C≡N
+            for n, edge_cn in graph.edges[c2].items():
+                if graph.nodes.get(n) == "N" and edge_cn.get("bond") == 3:
+                    cyano_nodes.append((c, c2))
+                    break
+                
 
     # ============================================================
     # 5️⃣ Recursively build substituents
@@ -570,6 +630,8 @@ def _build_acyclic_tree(graph: GraphNode, start_atom=None) -> TreeNode:
     # 6️⃣ Add carbonyl nodes (aldehyde vs ketone)
     # ============================================================
     terminal_carbons = {mainchain[0], mainchain[-1]}
+    if start_atom is not None:
+        terminal_carbons = terminal_carbons -set(graph.edges[start_atom].keys())
 
     for c, _ in carbonyl_pairs:
         label = "aldehyde" if c in terminal_carbons else "ketone"
@@ -598,7 +660,7 @@ def _build_acyclic_tree(graph: GraphNode, start_atom=None) -> TreeNode:
         )
 
     # ============================================================
-    # 🆕 7️⃣b Add halogen nodes
+    # 7️⃣b Add halogen nodes
     # ============================================================
     for c, x in halogen_nodes:
         root.add_child(
@@ -613,14 +675,26 @@ def _build_acyclic_tree(graph: GraphNode, start_atom=None) -> TreeNode:
         )
 
     # ============================================================
-    # 8️⃣ Restore removed oxygens (NO SIDE EFFECTS)
+    # 🆕 7️⃣c Add nitroso nodes
     # ============================================================
-    for o, symbol in removed_nodes:
-        graph.nodes[o] = symbol
-        graph.edges[o] = {}
 
-    for a, b, edge in removed_edges:
-        graph.edges.setdefault(a, {})[b] = edge
+    for c, n in nitro_nodes:
+        root.add_child(TreeNode(pos=numbering[c], chain_length=1, nodes=[n], label="nitro", bonds=[]))
+
+    # ============================================================
+    # 🆕 7️⃣d Add cyano nodes
+    # ============================================================
+    for c, c2 in cyano_nodes:
+        root.add_child(
+            TreeNode(
+                pos=numbering[c],
+                chain_length=1,
+                nodes=[c2],
+                label="cyano",
+                bonds=[]
+            )
+        )
+
 
     # ============================================================
     # 9️⃣ Final normalization
@@ -628,6 +702,7 @@ def _build_acyclic_tree(graph: GraphNode, start_atom=None) -> TreeNode:
     root.children.sort(key=lambda x: (x.pos, x.label))
 
     return root
+
 
 def _build_cyclic_tree(graph: GraphNode, cycle: list, start_atom=None) -> TreeNode:
     """
@@ -661,33 +736,50 @@ def _build_cyclic_tree(graph: GraphNode, cycle: list, start_atom=None) -> TreeNo
     ketone_pairs = []
     alcohol_nodes = []
     halogen_nodes = []
+    carbaldehyde_carbons = set()
+    carbaldehyde_nodes = []
+
 
     for atom in cycle:
         for nbr, edge in graph.edges[atom].items():
             if nbr in cycle_set:
                 continue
             sym = graph.nodes.get(nbr)
+
             if sym == "O":
                 if edge.get("bond", 1) == 2:
                     ketone_pairs.append((atom, nbr))
                 elif edge.get("bond", 1) == 1:
                     alcohol_nodes.append((atom, nbr))
+
+            elif sym == "C":
+                # detect –CHO (carbaldehyde) without explicit hydrogens
+                bonds = graph.edges[nbr]
+
+                # must have exactly one double-bonded oxygen
+                double_o = [
+                    x for x, e in bonds.items()
+                    if graph.nodes.get(x) == "O" and e.get("bond") == 2
+                ]
+
+                # heavy atom degree (exclude ring atom check later)
+                heavy_neighbors = [
+                    x for x in bonds
+                    if graph.nodes.get(x) != "H"
+                ]
+
+                # conditions for aldehyde carbon
+                if (
+                    len(double_o) == 1
+                    and len(heavy_neighbors) == 2  # ring C + O
+                    and atom in bonds              # bonded to ring carbon
+                ):
+                    carbaldehyde_carbons.add(atom)
+                    carbaldehyde_nodes.append((atom, nbr))
+
+
             elif sym in {"F", "Cl", "Br", "I"}:
                 halogen_nodes.append((atom, sym))
-
-    # ============================================================
-    # Temporarily remove ketone oxygens to avoid recursion
-    # ============================================================
-    removed_nodes = []
-    removed_edges = []
-    for c, o in ketone_pairs:
-        removed_edges.append((c, o, graph.edges[c][o]))
-        removed_edges.append((o, c, graph.edges[o][c]))
-        del graph.edges[c][o]
-        del graph.edges[o][c]
-        removed_nodes.append((o, graph.nodes[o]))
-        del graph.nodes[o]
-        del graph.edges[o]
 
     # ============================================================
     # Orient cycle (existing logic)
@@ -698,9 +790,11 @@ def _build_cyclic_tree(graph: GraphNode, cycle: list, start_atom=None) -> TreeNo
         cycle,
         substituents_dict,
         is_aromatic,
-        {c for c, _ in ketone_pairs},
-        start_atom
+        ketone_carbons={c for c, _ in ketone_pairs},
+        carbaldehyde_carbons=carbaldehyde_carbons,
+        start_atom=start_atom
     )
+
     
     bonds = [graph.edges[oriented_cycle[i]][oriented_cycle[(i + 1) % L]].get("bond", 1) for i in range(L)]
 
@@ -722,10 +816,47 @@ def _build_cyclic_tree(graph: GraphNode, cycle: list, start_atom=None) -> TreeNo
         for subgraph in subgraphs:
             if not subgraph.nodes:
                 continue
+
+            attach_atom = None
+            for n in subgraph.nodes:
+                orig_n = getattr(subgraph, "original_id", {}).get(n, n)
+                if atom in graph.edges.get(orig_n, {}):
+                    attach_atom = orig_n
+                    break
+
+            if attach_atom is None:
+                continue
+
+            bond_order = graph.edges[atom][attach_atom].get("bond", 1)
+
+                        
+            # 🔹 Recursive tree for the substituent
             sub_root = build_tree_recursive(subgraph, start_atom)
-            if sub_root:
-                sub_root.pos = pos
-                root.add_child(sub_root)
+            if not sub_root:
+                continue
+
+            # 🔹 Exocyclic unsaturation
+            if (
+                bond_order in (2, 3)
+                and sub_root.label == "mainchain"
+                and not sub_root.children
+                and all(b == 1 for b in sub_root.bonds)
+            ):
+                root.add_child(
+                    TreeNode(
+                        pos=pos,
+                        chain_length=sub_root.chain_length,
+                        nodes=sub_root.nodes,
+                        label="exocyclic_unsat",
+                        bonds=[],
+                        exo_bond=bond_order
+                    )
+                )
+                continue
+
+            # 🔹 Normal attachment
+            sub_root.pos = pos
+            root.add_child(sub_root)
 
     # ============================================================
     # Add ketone nodes
@@ -770,15 +901,6 @@ def _build_cyclic_tree(graph: GraphNode, cycle: list, start_atom=None) -> TreeNo
             )
         )
 
-    # ============================================================
-    # Restore removed ketone nodes
-    # ============================================================
-    for o, sym in removed_nodes:
-        graph.nodes[o] = sym
-        graph.edges[o] = {}
-    for a, b, edge in removed_edges:
-        graph.edges.setdefault(a, {})[b] = edge
-
     root.children.sort(key=lambda x: (x.pos, x.label))
     return root
 
@@ -815,8 +937,10 @@ def _orient_cycle(
     substituents_dict: dict,
     is_aromatic: bool = False,
     ketone_carbons=None,
+    carbaldehyde_carbons=None,
     start_atom=None
 ):
+
     """
     Orient a cyclic structure for IUPAC naming.
     Handles ketones, alcohols, and halogens.
@@ -824,6 +948,7 @@ def _orient_cycle(
     Returns the best oriented list of atoms around the ring.
     """
     ketone_carbons = ketone_carbons or set()
+    carbaldehyde_carbons = carbaldehyde_carbons or set()
 
     def get_cycle_bonds(oriented):
         L = len(oriented)
@@ -861,10 +986,12 @@ def _orient_cycle(
     # 🔁 Use enumerated cycle numberings
     for oriented in enumerate_cycle_numberings(cycle, start_atom):
         score = (
+            tuple(i + 1 for i, a in enumerate(oriented) if a in carbaldehyde_carbons),
             tuple(i + 1 for i, a in enumerate(oriented) if a in ketone_carbons),
             substituent_locants(oriented),
             substituent_alpha_sequence(oriented),
         )
+
 
         if best_score is None or score < best_score:
             best_score = score
@@ -1049,15 +1176,19 @@ def iupac_name(root: "TreeNode") -> str:
 
     # Functional groups
     acid_children = [c for c in root.children if c.label == "carboxylic_acid"]
-    aldehyde_children = [c for c in root.children if c.label in ("aldehyde", "carbaldehyde")]
+    aldehyde_children = [c for c in root.children if c.label in ("aldehyde")]
+    carbaldehyde_children = [c for c in root.children if c.label in ("carbaldehyde")]
     ketone_children = [c for c in root.children if c.label == "ketone"]
     alcohol_children = [c for c in root.children if c.label == "alcohol"]
+    cyano_children = [c for c in root.children if c.label == "cyano"]
 
     acid_pos = sorted(c.pos for c in acid_children)
     aldehyde_pos = sorted(c.pos for c in aldehyde_children)
+    carbaldehyde_pos = sorted(c.pos for c in carbaldehyde_children)
     ketone_pos = sorted(c.pos for c in ketone_children)
     alcohol_pos = sorted(c.pos for c in alcohol_children)
-
+    cyano_pos = sorted(c.pos for c in cyano_children)
+    
     has_acid = bool(acid_pos)
     has_higher = has_acid or bool(aldehyde_pos)
 
@@ -1073,7 +1204,29 @@ def iupac_name(root: "TreeNode") -> str:
     for child in root.children:
         if child.label == "halogen":
             prefix_dict[HALOGEN[child.atom]].append(child.pos)
+            
+    # Cyano groups (always prefix)
+    for pos in cyano_pos:
+        prefix_dict["cyano"].append(pos)
 
+    for child in root.children:
+        if child.label == "nitro":
+            prefix_dict["nitro"].append(child.pos)
+
+    # Exocyclic unsaturation
+    for child in root.children:
+        if child.label == "exocyclic_unsat":
+            bond = getattr(child, "exo_bond", 1)
+            stem = ALKANE_STEM.get(child.chain_length, "alk")  # e.g., meth, eth, prop...
+            if bond == 2:
+                prefix_name = f"{stem}ylidene"
+            elif bond == 3:
+                prefix_name = f"{stem}ylidyne"
+            else:
+                prefix_name = f"{stem}yl"  # fallback, single bond
+            prefix_dict[prefix_name].append(child.pos)
+
+    
     # Substituents (alkyl, cycle)
     for child in root.children:
         if child.label in ("mainchain", "cycle"):
@@ -1146,7 +1299,13 @@ def iupac_name(root: "TreeNode") -> str:
         mult = MULTIPLIER[len(alcohol_pos)] if len(alcohol_pos) > 1 else ""
         locs = ','.join(map(str, alcohol_pos))
         suffix = f"{locs}-{mult}ol"
-
+    elif carbaldehyde_pos:
+        mult = MULTIPLIER[len(carbaldehyde_pos)] if len(carbaldehyde_pos) > 1 else ""
+        if len(carbaldehyde_pos) == 1 and carbaldehyde_pos[0] == 1:
+            suffix = mult + "carbaldehyde"
+        else:
+            locs = ','.join(map(str, carbaldehyde_pos))
+            suffix = f"{locs}-{mult}carbaldehyde"
     core = "-".join(core_parts) + (f"-{suffix}" if suffix else "")
 
     # Vowel elision
@@ -1344,15 +1503,198 @@ def draw_graph_with_rdkit(graph, filename="compound.png", size=(600, 400)):
     img.save(filename)
     print(f"Saved {filename}")
 
-def iupac(graph, debug=False):
+def functional_group_distances(root: "TreeNode", target_label: str):
+    """
+    Correct functional group distances using backbone positions
+    when a common parent chain exists.
+    """
+
+    FUNCTIONAL_GROUP_LABELS = {
+        "carboxylic_acid",
+        "aldehyde",
+        "ketone",
+        "alcohol",
+        "cyano",
+        "nitro",
+        "halogen",
+    }
+
+    parent = {}
+
+    def build_parent(node):
+        for child in getattr(node, "children", []):
+            parent[child] = node
+            build_parent(child)
+
+    build_parent(root)
+
+    functional_nodes = []
+
+    def collect(node):
+        if node.label in FUNCTIONAL_GROUP_LABELS:
+            functional_nodes.append(node)
+        for c in getattr(node, "children", []):
+            collect(c)
+
+    collect(root)
+
+    targets = [n for n in functional_nodes if n.label == target_label]
+    results = []
+
+    def path_to_root(node):
+        p = []
+        while node:
+            p.append(node)
+            node = parent.get(node)
+        return p
+
+    for t in targets:
+        path_t = path_to_root(t)
+
+        for other in functional_nodes:
+            if other is t:
+                continue
+
+            path_o = path_to_root(other)
+
+            # Find lowest common ancestor
+            lca = next((n for n in path_t if n in path_o), None)
+
+            if lca and lca.label in ("mainchain", "cycle"):
+                # Backbone-based distance
+                dist = abs(t.pos - other.pos) + 1
+            else:
+                # Pure tree distance fallback
+                dist = path_t.index(lca) + path_o.index(lca)
+
+            results.append({
+                "to_label": other.label,
+                "distance": dist
+            })
+
+    return results
+def group_halogens(fg_distances):
+    """
+    Convert functional group distances into grouped names for halogens.
+    Example: two chlorine atoms at same distance -> 'dichloro'.
+
+    Parameters
+    ----------
+    fg_distances : list of dict
+        [{"to_label": "chloro", "distance": 2}, ...]
+
+    Returns
+    -------
+    list of dict
+        [{"to_label": "dichloro", "distance": 2}, ...]
+    """
+    from collections import defaultdict
+
+    # Map for multiplicative prefixes
+    MULTIPLIER = {2: "di", 3: "tri", 4: "tetra", 5: "penta"}
+
+    # Group by label + distance
+    grouped = defaultdict(int)  # (label, distance) -> count
+    for fg in fg_distances:
+        key = (fg["to_label"], fg["distance"])
+        grouped[key] += 1
+
+    # Build new list with combined names
+    new_list = []
+    for (label, distance), count in grouped.items():
+        if label in {"fluoro", "chloro", "bromo", "iodo"} and count > 1:
+            prefix = MULTIPLIER.get(count, f"{count}x")
+            new_label = f"{prefix}{label}"
+        else:
+            new_label = label
+        new_list.append({"to_label": new_label, "distance": distance})
+
+    return new_list
+
+def build_tree(graph):
     tmp = build_tree_recursive(graph)
-    
     normalize_carboxylic_acids(tmp)
     convert_carbaldehyde_nodes(tmp)
+    return tmp
+def compare_acid_strength(graph_a: "GraphNode", graph_b: "GraphNode") -> int:
+    """
+    Compare acidity between two compounds.
+
+    Returns
+    -------
+    1 if a > b (a stronger),
+    -1 if a < b (b stronger),
+    0 if unsure or equal.
+    """
+
+    # Step 1: Build TreeNode
+    tree_a = build_tree(graph_a)
+    tree_b = build_tree(graph_b)
+
+    # Step 2: Detect acidic functional groups
+    acid_labels = {"carboxylic_acid", "alcohol"}
+    acids_a = [c for c in tree_a.children if c.label in acid_labels]
+    acids_b = [c for c in tree_b.children if c.label in acid_labels]
+
+    if not acids_a or not acids_b:
+        return 0  # no acid found, unsure
+
+    # Step 3: If types differ, cannot compare
+    type_a = acids_a[0].label
+    type_b = acids_b[0].label
+    if type_a != type_b:
+        return 0
+
+    # Step 4: Compute functional group distances and group halogens
+    fg_dist_a = group_halogens(functional_group_distances(tree_a, target_label=type_a))
+    fg_dist_b = group_halogens(functional_group_distances(tree_b, target_label=type_b))
+
+    # Step 5: Define inductive strengths
+    INDUCTIVE_STRENGTH = {
+        "nitro": 5,
+        "cyano": 4,
+        "halogen": 3,
+        "fluoro": 3,
+        "chloro": 2,
+        "bromo": 2,
+        "iodo": 1,
+        "dichloro": 3,
+        "trichloro": 4
+    }
+
+    # Step 6: Compute simple inductive score
+    def inductive_score(fg_distances):
+        if not fg_distances:
+            return 0
+        return sum(INDUCTIVE_STRENGTH.get(fg["to_label"], 1) / fg["distance"] for fg in fg_distances)
+
+    score_a = inductive_score(fg_dist_a)
+    score_b = inductive_score(fg_dist_b)
+
+    # Step 7: Compare scores
+    if abs(score_a - score_b) < 1e-6:
+        # distances equal → check strongest EWG
+        max_a = max((INDUCTIVE_STRENGTH.get(fg["to_label"], 0) for fg in fg_dist_a), default=0)
+        max_b = max((INDUCTIVE_STRENGTH.get(fg["to_label"], 0) for fg in fg_dist_b), default=0)
+        if max_a > max_b:
+            return 1
+        elif max_b > max_a:
+            return -1
+        else:
+            return 0  # still unsure
+    elif score_a > score_b:
+        return 1
+    else:
+        return -1
+
+
+def iupac(graph, debug=False):
+    tmp = build_tree(graph)
     if debug:
         print(tmp)
     return remove_unnecessary_hyphens(tree_to_iupac(tmp))
 def smiles(string):
     return smiles_to_graphnode(string)
-def draw(graph, filename="compound.png", size=(600, 400)):
+def draw(graph, filename="compound.png", size=(300, 200)):
     draw_graph_with_rdkit(graph, filename, size)
+
