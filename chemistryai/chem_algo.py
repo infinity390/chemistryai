@@ -43,9 +43,6 @@ class GraphNode:
         self.edges[i][j] = data
         self.edges[j][i] = data
 
-    def __hash__(self):
-        pass
-
     def recursive_equals(self, other):
         if not isinstance(other, GraphNode):
             return False
@@ -850,7 +847,6 @@ def needs_parentheses(name: str) -> bool:
         return False
     return False
 
-
 VOWEL_STARTING_SUFFIXES = (
     "ol",
     "al",
@@ -862,19 +858,28 @@ VOWEL_STARTING_SUFFIXES = (
     "hydroxy",
 )
 
-
 def elide_unsaturation_e(name: str) -> str:
     if "benzene" in name:
         return name
+
     for suf in VOWEL_STARTING_SUFFIXES:
         name = re.sub(
-            rf"ene(-\d+)?-{suf}", lambda m: f"en{m.group(1) or ''}-{suf}", name
+            rf"ane(-\d+)?-{suf}",
+            lambda m: f"an{m.group(1) or ''}-{suf}",
+            name,
         )
         name = re.sub(
-            rf"yne(-\d+)?-{suf}", lambda m: f"yn{m.group(1) or ''}-{suf}", name
+            rf"ene(-\d+)?-{suf}",
+            lambda m: f"en{m.group(1) or ''}-{suf}",
+            name,
         )
-    return name
+        name = re.sub(
+            rf"yne(-\d+)?-{suf}",
+            lambda m: f"yn{m.group(1) or ''}-{suf}",
+            name,
+        )
 
+    return name
 
 def tree_to_iupac(root):
     return elide_unsaturation_e(iupac_name(root))
@@ -1040,20 +1045,14 @@ def iupac_name(root: "TreeNode") -> str:
         )
         if is_cyclic:
             cyclo_prefix = "cyclo"
-            if has_suffix or unsaturation:
-                if unsaturation:
-                    stem = f"{cyclo_prefix}{ALKANE_STEM[root.chain_length]}"
-                else:
-                    stem = f"{cyclo_prefix}{ALKANE_STEM[root.chain_length]}an"
+            if unsaturation:
+                stem = f"{cyclo_prefix}{ALKANE_STEM[root.chain_length]}"
             else:
                 stem = f"{cyclo_prefix}{ALKANE_STEM[root.chain_length]}ane"
             core_parts.append(stem)
         else:
-            if has_suffix or unsaturation:
-                if unsaturation:
-                    stem = ALKANE_STEM[root.chain_length]
-                else:
-                    stem = ALKANE_STEM[root.chain_length] + "an"
+            if unsaturation:
+                stem = ALKANE_STEM[root.chain_length]
             else:
                 stem = ALKANE_STEM[root.chain_length] + "ane"
             core_parts.append(stem)
@@ -2029,25 +2028,21 @@ def count_hyperconjugation(graph, include_CC=False):
                         count += 1
     return count
 
-
 def custom_sort(items, cmp):
-    labels = {obj: string.ascii_lowercase[i] for i, obj in enumerate(items)}
-    score = {obj: 0 for obj in items}
-    for a in items:
-        for b in items:
-            if a is b:
-                continue
-            c = cmp(a, b)
-            if c == 1:
-                score[a] += 1
-                score[b] -= 1
-            elif c == -1:
-                score[a] -= 1
-                score[b] += 1
-    buckets = {}
-    for obj, s in score.items():
-        buckets.setdefault(s, []).append(labels[obj])
-    return [buckets[s] for s in sorted(buckets, reverse=True)]
+    indices = list(range(len(items)))
+    result = []
+
+    for idx in indices:
+        inserted = False
+        for i in range(len(result)):
+            if cmp(items[idx], items[result[i]]) == 1:
+                result.insert(i, idx)
+                inserted = True
+                break
+        if not inserted:
+            result.append(idx)
+
+    return " > ".join([string.ascii_lowercase[i] for i in result])
 
 
 def iupac(graph, debug=False):
@@ -2424,7 +2419,9 @@ def molec(a, b=None):
     if b is None:
         lst2.pop(-1)
     for item in lst2:
-        if item == "hydroxide":
+        if isinstance(item, GraphNode):
+            lst.append(item)
+        elif item == "hydroxide":
             lst.append(make_hydroxide())
         elif item == "proton":
             lst.append(make_proton())
