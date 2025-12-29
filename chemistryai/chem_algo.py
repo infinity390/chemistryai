@@ -1,1 +1,2437 @@
-from fractions import Fractionimport stringimport copyimport refrom rdkit import Chemfrom rdkit.Chem import AllChem, Drawfrom collections import defaultdictfrom collections import dequefrom collections import Counterimport itertoolsclass GraphNode:    def __init__(self):        self.nodes = {}                  self.node_tags = {}              self.edges = {}                  self.charges = {}                self.radicals = {}               self.lone_pairs = {}             self.attached_h = {}             self._next_id = 0    def add_node(self, atom, tags=None, charge=0, radical=0):        idx = self._next_id        self.nodes[idx] = atom        self.node_tags[idx] = set(tags) if tags else set()        self.edges[idx] = {}        self.charges[idx] = charge        self.radicals[idx] = radical        self.lone_pairs[idx] = 0        self.attached_h[idx] = 0        self._next_id += 1        return idx    def copy(self):        return copy.deepcopy(self)    def add_edge(self, i, j, bond=1, tags=None):        if bond not in (1, 2, 3):            raise ValueError("Bond must be 1, 2, or 3")        data = {"bond": bond, "tags": set(tags) if tags else set()}        self.edges[i][j] = data        self.edges[j][i] = data    def __hash__(self):        pass    def recursive_equals(self, other):        if not isinstance(other, GraphNode):            return False        if len(self.nodes) != len(other.nodes):            return False        self_ids = list(self.nodes.keys())        other_ids = list(other.nodes.keys())        for i in self_ids:            for j in other_ids:                if self._match_from(i, other, j, {}):                    return True        return False    def _match_from(self, i, other, j, mapping):        if i in mapping:            return mapping[i] == j        if j in mapping.values():            return False        if self.nodes[i] != other.nodes[j]:            return False        if self.attached_h.get(i, 0) != other.attached_h.get(j, 0):            return False        if len(self._neighbors(i)) != len(other._neighbors(j)):            return False        mapping[i] = j        self_neighbors = self._neighbors(i)        other_neighbors = other._neighbors(j)        for si, s_bond in self_neighbors:            matched = False            for oj, o_bond in other_neighbors:                if o_bond != s_bond:                    continue                new_mapping = dict(mapping)                if self._match_from(si, other, oj, new_mapping):                    mapping.update(new_mapping)                    matched = True                    break            if not matched:                return False        return True    def _neighbors(self, node_id):        result = []        if node_id not in self.edges:            return result        for nbr_id, data in self.edges[node_id].items():            result.append((nbr_id, data.get("bond", 1)))        return result    def __eq__(self, other):        return self.recursive_equals(other)    def __contains__(self, item):        for x in self.items:            if x == item:                   return True        return False    def find_cycle(self):        visited = set()        parent = {}        def dfs(v, p):            visited.add(v)            parent[v] = p            for neighbor in self.edges[v]:                if neighbor == p:                      continue                if neighbor in visited:                    cycle = [neighbor]                    curr = v                    while curr != neighbor:                        cycle.append(curr)                        curr = parent[curr]                    return cycle                else:                    result = dfs(neighbor, v)                    if result:                        return result            return None        for node in self.nodes:            if node not in visited:                cycle = dfs(node, None)                if cycle:                    return cycle        return None    def remove_node(self, node_id):        for nbr in list(self.edges.get(node_id, {})):            self.edges[nbr].pop(node_id, None)        self.edges.pop(node_id, None)        self.nodes.pop(node_id, None)        self.node_tags.pop(node_id, None)        if hasattr(self, "charges"):            self.charges.pop(node_id, None)        if hasattr(self, "radicals"):            self.radicals.pop(node_id, None)        if hasattr(self, "lone_pairs"):            self.lone_pairs.pop(node_id, None)    def has_cycle(self):        return self.find_cycle() is not None    def tag_mainchain(self, atom="C", tag="mainchain"):        acid_carbons, aldehyde_carbons, ketone_carbons, alcohol_carbons = set(), set(), set(), set()        for o_id, sym in self.nodes.items():            if sym != "O":                continue            for c_id, edge in self.edges[o_id].items():                if self.nodes.get(c_id) != "C":                    continue                bond = edge.get("bond", 1)                carbon_neighbors = [n for n in self.edges[c_id] if self.nodes.get(n) == "C"]                if bond == 2:                    if len(carbon_neighbors) == 1:                        aldehyde_carbons.add(c_id)                    else:                        ketone_carbons.add(c_id)                else:                    alcohol_carbons.add(c_id)        all_numberings = enumerate_acyclic_mainchains(self, atom)        if not all_numberings:            return [], {}        def score_chain(chain):            length = len(chain)            bonds = [                self.edges[chain[i]][chain[i + 1]].get("bond", 1)                for i in range(length - 1)            ]            unsat = sum(1 for b in bonds if b > 1)            fg_positions = []            for group in (acid_carbons, aldehyde_carbons, ketone_carbons, alcohol_carbons):                fg_positions.extend(i + 1 for i, c in enumerate(chain) if c in group)                if fg_positions:                    break            fg_positions = fg_positions or [length + 1]            substituent_locs = []            for i, c in enumerate(chain):                for n in self.edges[c]:                    if n in chain:                        continue                    sym = self.nodes.get(n)                    if sym in HALOGEN:                        substituent_locs.append(i + 1)                        break                    if sym == "C":                        substituent_locs.append(i + 1)                        break            sum_sub_locs = sum(substituent_locs) if substituent_locs else 0            return (                -length,                          fg_positions,                     -unsat,                           sum_sub_locs                  )        best_chain = None        best_score = None        for chain, _ in all_numberings:            sc = score_chain(chain)            if best_score is None or sc < best_score:                best_score = sc                best_chain = chain        numbering = {atom_id: pos for pos, atom_id in enumerate(best_chain, 1)}        for atom_id in best_chain:            self.node_tags.setdefault(atom_id, set()).add(tag)        return best_chain, numbering    def __repr__(self):        return graphnode_to_smiles(self)    def collect_subgraph(self, start_node, exclude=None):        if exclude is None:            exclude = set()        seen = set()        def dfs(node):            if node in seen or node in exclude:                return            seen.add(node)            for nbr in self.edges[node]:                dfs(nbr)        dfs(start_node)        return list(seen)    def subgraph(self, node_ids):        sub = GraphNode()        sub.original_id = {}          m = {}        for i in node_ids:            new_id = sub.add_node(self.nodes[i], self.node_tags[i])            m[i] = new_id            sub.original_id[new_id] = i          for i in node_ids:            for j, e in self.edges[i].items():                if j in node_ids and m[i] < m[j]:                    sub.add_edge(m[i], m[j], e["bond"], e["tags"])        return sub    def get_substituents(self, mainchain):        attachments = {}        main_set = set(mainchain)          for atom in mainchain:              subs = []            for neighbor in self.edges[atom]:                if neighbor in main_set:                    continue                  sub_nodes = self.collect_subgraph(neighbor, exclude=main_set)                if not sub_nodes:                    continue                subgraph = self.subgraph(sub_nodes)                subs.append(subgraph)            if subs:                attachments[atom] = subs        return attachmentsVALENCE_ELECTRONS = {    "C": 4, "N": 5, "O": 6,    "F": 7, "Cl": 7, "Br": 7, "I": 7,    "S": 6, "P": 5,}NORMAL_VALENCE = {    "C": 4,    "N": 3,    "O": 2,    "F": 1,    "Cl": 1,    "Br": 1,    "I": 1,}EXPANDED_VALENCE = {    "S": (2, 4, 6),    "P": (3, 5),}def calculate_electron_state(graph: GraphNode):    for i, atom in graph.nodes.items():        a = atom.upper()        if a not in VALENCE_ELECTRONS:            continue        v = VALENCE_ELECTRONS[a]        c = graph.charges.get(i, 0)        r = graph.radicals.get(i, 0)        bonding = sum(e["bond"] for e in graph.edges.get(i, {}).values())        if c != 0:            h = 0          elif a in NORMAL_VALENCE:            h = max(0, NORMAL_VALENCE[a] - bonding)        elif a in EXPANDED_VALENCE:            h = 0          else:            h = 0        graph.attached_h[i] = h        used = 2 * bonding + r + h - c        remaining = max(0, v - used)        graph.lone_pairs[i] = remaining // 2class TreeNode:    def __init__(self, pos, chain_length, nodes=None, label="", bonds=None, is_cyclic=False, atom=None, exo_bond=None, charge=0):        self.pos = pos        self.chain_length = chain_length        self.nodes = nodes or []        self.label = label        self.bonds = bonds or [1] * (len(self.nodes) - 1)        self.is_cyclic = is_cyclic        self.children = []        self.atom = atom        self.exo_bond = exo_bond        self.charge = charge    def add_child(self, c):        self.children.append(c)    def __repr__(self, level=0):        ind = "  " * level        s = f"{ind}TreeNode(pos={self.pos}, chain_length={self.chain_length}"        if self.label:            s += f", label={self.label}"        if self.is_cyclic:            s += f", cyclic=True"        if self.nodes:            s += f", nodes={self.nodes}"        if self.bonds:            s += f", bonds={self.bonds}"        if self.charge != 0:            s += f", charge={self.charge}"        s += ")"        for c in self.children:            s += "\n" + c.__repr__(level + 1)        return sALKANE = {    1: "meth",    2: "eth",    3: "prop",    4: "but",    5: "pent",    6: "hex",    7: "hept",    8: "oct",    9: "non",    10: "dec"}MULTIPLIER = {    2: "di",    3: "tri",    4: "tetra",    5: "penta",    6: "hexa",    7: "hepta"}HALOGEN = {    "F": "fluoro",    "Cl": "chloro",    "Br": "bromo",    "I": "iodo"}HETERO = {    "O": "oxy"}FUNCTIONAL_GROUP_LABELS = {    "carboxylic_acid",    "aldehyde",    "ketone",    "alcohol",    "cyano",    "nitro",    "halogen",}def enumerate_acyclic_mainchains(graph: GraphNode, atom="C"):    cycle = graph.find_cycle()      cycle_nodes = set(cycle) if cycle else set()    potential_starts = []    for nid, sym in graph.nodes.items():        if sym != atom or nid in cycle_nodes:            continue        carbon_neighbors = [nbr for nbr in graph.edges[nid]                             if graph.nodes[nbr] == atom and nbr not in cycle_nodes]        if len(carbon_neighbors) <= 1:              potential_starts.append(nid)    raw_chains = []    def dfs(node, visited, path):        visited.add(node)        path.append(node)        extended = False        for nbr in graph.edges[node]:            if nbr in visited:                continue            if graph.nodes[nbr] != atom:                continue            if nbr in cycle_nodes:                continue              dfs(nbr, visited, path)            extended = True        if not extended:            raw_chains.append(path.copy())        path.pop()        visited.remove(node)    for start in potential_starts:        dfs(start, set(), [])    all_numberings = []    for chain in raw_chains:        numbering = {nid: pos for pos, nid in enumerate(chain, 1)}        all_numberings.append((chain, numbering))    return all_numberingsdef has_single_carbon_attachment_with_halogen_or_oxygen(    graph: GraphNode,    cycle: list) -> bool:    cycle_set = set(cycle)    for c in cycle:        external = [n for n in graph.edges[c] if n not in cycle_set]        if len(external) != 1:            continue        start = external[0]        stack = [start]        visited = {c} | cycle_set        found_carbon = False        found_hetero = False        while stack:            node = stack.pop()            if node in visited:                continue            visited.add(node)            sym = graph.nodes.get(node)            if sym == "C":                found_carbon = True            elif sym == "O" or sym in HALOGEN:                found_hetero = True            for nbr in graph.edges[node]:                if nbr not in visited:                    stack.append(nbr)        if found_carbon and found_hetero:            return c    return Nonedef children_only_ketone_or_halogen(node: "TreeNode") -> bool:    allowed = {        "ketone",        "halogen",        "fluoro",        "chloro",        "bromo",        "iodo",        "aldehyde"    }    for child in node.children:        if child.label in allowed:            return True        if children_only_ketone_or_halogen(child):            return True    return Falsedef build_tree_recursive(graph: GraphNode,start_atom=None) -> TreeNode:    def has_carbon(g: GraphNode) -> bool:        return any(sym in ["c","C"] for sym in g.nodes.values())    if not has_carbon(graph):        return None      cycle = graph.find_cycle()    if cycle:        out2 = _build_cyclic_tree(graph, cycle, start_atom)        convert_carbaldehyde_nodes(out2)        if not children_only_ketone_or_halogen(out2):            return out2        out = has_single_carbon_attachment_with_halogen_or_oxygen(graph, cycle)        if out:            return _build_acyclic_tree(graph, out)        return _build_cyclic_tree(graph, cycle, start_atom)    return _build_acyclic_tree(graph, start_atom)def normalize_carboxylic_acids(root: TreeNode):    by_pos = defaultdict(list)    for child in root.children:        by_pos[child.pos].append(child)    new_children = []    for pos, nodes in by_pos.items():        labels = {n.label for n in nodes}        if "aldehyde" in labels and "alcohol" in labels:            new_children.append(                TreeNode(                    pos=pos,                    chain_length=1,                    nodes=[pos],                       label="carboxylic_acid",                    bonds=[]                )            )        else:            new_children.extend(nodes)    root.children = sorted(new_children, key=lambda x: (x.pos, x.label))def _build_acyclic_tree(graph: GraphNode, start_atom=None) -> TreeNode:    mainchain, numbering = graph.tag_mainchain()    if not mainchain:        raise ValueError("No main chain found")    L = len(mainchain)    bonds = [        graph.edges[mainchain[i]][mainchain[i + 1]].get("bond", 1)        for i in range(L - 1)    ]    root = TreeNode(        pos=0,        chain_length=L,        nodes=mainchain[:],        label="mainchain",        bonds=bonds    )    carbonyl_pairs = []    for c in mainchain:        for nbr, edge in graph.edges[c].items():            if graph.nodes.get(nbr) == "O" and edge.get("bond") == 2:                carbonyl_pairs.append((c, nbr))    alcohol_nodes = []    for c in mainchain:        for nbr, edge in graph.edges[c].items():            if graph.nodes.get(nbr) == "O" and edge.get("bond", 1) == 1:                alcohol_nodes.append((c, nbr))    halogen_nodes = []    for c in mainchain:        for nbr, edge in graph.edges[c].items():            if graph.nodes.get(nbr) in HALOGEN and edge.get("bond", 1) == 1:                halogen_nodes.append((c, nbr))    nitro_nodes = []    for c in mainchain:        for nbr, edge in graph.edges[c].items():            if graph.nodes.get(nbr) == "N":                oxy_count = 0                for n2, e2 in graph.edges[nbr].items():                    if n2 != c and graph.nodes.get(n2) == "O" and e2.get("bond") in (1, 2):                        oxy_count += 1                if oxy_count == 2:                    nitro_nodes.append((c, nbr))    cyano_nodes = []    for c in mainchain:        for c2, edge_cc in graph.edges[c].items():            if graph.nodes.get(c2) != "C" or edge_cc.get("bond") != 1:                continue            for n, edge_cn in graph.edges[c2].items():                if graph.nodes.get(n) == "N" and edge_cn.get("bond") == 3:                    cyano_nodes.append((c, c2))                    break    for i, atom in enumerate(mainchain):        charge = graph.charges.get(atom, 0)        if charge != 0 and graph.nodes.get(atom) == "C":            root.add_child(                TreeNode(                    pos=i + 1,                                    chain_length=1,                    nodes=[atom],                    label="charged_carbon",                    bonds=[],                    charge=charge                            )            )    attachments = graph.get_substituents(mainchain)    for atom in mainchain:        pos = numbering[atom]        for subgraph in attachments.get(atom, []):            if not subgraph.nodes:                continue            sub_root = build_tree_recursive(subgraph, start_atom)            if sub_root:                sub_root.pos = pos                root.add_child(sub_root)    terminal_carbons = {mainchain[0], mainchain[-1]}    if start_atom is not None:        terminal_carbons = terminal_carbons -set(graph.edges[start_atom].keys())    for c, _ in carbonyl_pairs:        label = "aldehyde" if c in terminal_carbons else "ketone"        root.add_child(            TreeNode(                pos=numbering[c],                chain_length=1,                nodes=[c],                label=label,                bonds=[]            )        )    for c, o in alcohol_nodes:        root.add_child(            TreeNode(                pos=numbering[c],                chain_length=1,                nodes=[o],                label="alcohol",                bonds=[]            )        )    for c, x in halogen_nodes:        root.add_child(            TreeNode(                pos=numbering[c],                chain_length=1,                nodes=[x],                label="halogen",                atom=graph.nodes[x],                bonds=[]            )        )    for c, n in nitro_nodes:        root.add_child(TreeNode(pos=numbering[c], chain_length=1, nodes=[n], label="nitro", bonds=[]))    for c, c2 in cyano_nodes:        root.add_child(            TreeNode(                pos=numbering[c],                chain_length=1,                nodes=[c2],                label="cyano",                bonds=[]            )        )    root.children.sort(key=lambda x: (x.pos, x.label))    return rootdef _build_cyclic_tree(graph: GraphNode, cycle: list, start_atom=None) -> TreeNode:    L = len(cycle)    cycle_set = set(cycle)    ring_bonds = [graph.edges[cycle[i]][cycle[(i + 1) % L]].get("bond", 1) for i in range(L)]    ring_tags = [graph.edges[cycle[i]][cycle[(i + 1) % L]].get("tags", set()) for i in range(L)]    is_aromatic = all("aromatic" in t for t in ring_tags) or (ring_bonds.count(2) == 3 and ring_bonds.count(1) == 3)    substituents_dict = {}    for atom in cycle:        for nbr in graph.edges[atom]:            if nbr not in cycle_set:                substituents_dict[atom] = True                break    ketone_pairs = []    alcohol_nodes = []    halogen_nodes = []    carbaldehyde_carbons = set()    carbaldehyde_nodes = []    for atom in cycle:        for nbr, edge in graph.edges[atom].items():            if nbr in cycle_set:                continue            sym = graph.nodes.get(nbr)            if sym == "O":                if edge.get("bond", 1) == 2:                    ketone_pairs.append((atom, nbr))                elif edge.get("bond", 1) == 1:                    alcohol_nodes.append((atom, nbr))            elif sym == "C":                bonds = graph.edges[nbr]                double_o = [                    x for x, e in bonds.items()                    if graph.nodes.get(x) == "O" and e.get("bond") == 2                ]                heavy_neighbors = [                    x for x in bonds                    if graph.nodes.get(x) != "H"                ]                if (                    len(double_o) == 1                    and len(heavy_neighbors) == 2                      and atom in bonds                              ):                    carbaldehyde_carbons.add(atom)                    carbaldehyde_nodes.append((atom, nbr))            elif sym in {"F", "Cl", "Br", "I"}:                halogen_nodes.append((atom, sym))    oriented_cycle = _orient_cycle(        graph,        cycle,        substituents_dict,        is_aromatic,        ketone_carbons={c for c, _ in ketone_pairs},        carbaldehyde_carbons=carbaldehyde_carbons,        start_atom=start_atom    )    bonds = [graph.edges[oriented_cycle[i]][oriented_cycle[(i + 1) % L]].get("bond", 1) for i in range(L)]    root = TreeNode(        pos=0,        chain_length=L,        nodes=oriented_cycle,        label="cycle",        bonds=bonds,        is_cyclic=True    )    attachments = graph.get_substituents(oriented_cycle)    for atom, subgraphs in attachments.items():        pos = oriented_cycle.index(atom) + 1        for subgraph in subgraphs:            if not subgraph.nodes:                continue            attach_atom = None            for n in subgraph.nodes:                orig_n = getattr(subgraph, "original_id", {}).get(n, n)                if atom in graph.edges.get(orig_n, {}):                    attach_atom = orig_n                    break            if attach_atom is None:                continue            bond_order = graph.edges[atom][attach_atom].get("bond", 1)            sub_root = build_tree_recursive(subgraph, start_atom)            if not sub_root:                continue            if (                bond_order in (2, 3)                and sub_root.label == "mainchain"                and not sub_root.children                and all(b == 1 for b in sub_root.bonds)            ):                root.add_child(                    TreeNode(                        pos=pos,                        chain_length=sub_root.chain_length,                        nodes=sub_root.nodes,                        label="exocyclic_unsat",                        bonds=[],                        exo_bond=bond_order                    )                )                continue            sub_root.pos = pos            root.add_child(sub_root)    for c, _ in ketone_pairs:        root.add_child(            TreeNode(                pos=oriented_cycle.index(c) + 1,                chain_length=1,                nodes=[_],                label="ketone",                bonds=[]            )        )    for atom, nbr in alcohol_nodes:        root.add_child(            TreeNode(                pos=oriented_cycle.index(atom) + 1,                chain_length=1,                nodes=[nbr],                label="alcohol",                bonds=[]            )        )    for atom, sym in halogen_nodes:        root.add_child(            TreeNode(                pos=oriented_cycle.index(atom) + 1,                chain_length=1,                nodes=[atom],                label="halogen",                bonds=[],                atom=sym              )        )    root.children.sort(key=lambda x: (x.pos, x.label))    return rootdef enumerate_cycle_numberings(cycle, start_atom=None):    L = len(cycle)    numberings = []    if start_atom is None:        starts = range(L)    else:        if start_atom not in cycle:            raise ValueError("start_atom not in cycle")        starts = [cycle.index(start_atom)]    for start in starts:        numberings.append([cycle[(start + i) % L] for i in range(L)])        numberings.append([cycle[(start - i) % L] for i in range(L)])    return numberingsdef _orient_cycle(    graph: GraphNode,    cycle: list,    substituents_dict: dict,    is_aromatic: bool = False,    ketone_carbons=None,    carbaldehyde_carbons=None,    start_atom=None):    ketone_carbons = ketone_carbons or set()    carbaldehyde_carbons = carbaldehyde_carbons or set()    def get_cycle_bonds(oriented):        L = len(oriented)        return [            graph.edges[oriented[i]][oriented[(i + 1) % L]].get("bond", 1)            for i in range(L)        ]    def substituent_locants(oriented):        return tuple(            i + 1 for i, a in enumerate(oriented)            if a in substituents_dict        )    def substituent_alpha_sequence(oriented):        seq = []        for i, atom in enumerate(oriented):            if atom in substituents_dict:                for nbr in graph.edges[atom]:                    if nbr not in oriented:                        sym = graph.nodes[nbr]                        name = HALOGEN.get(sym, sym)                        priority = 0 if sym in HALOGEN else 1                        seq.append((priority, name, i + 1))        seq.sort(key=lambda x: (x[0], x[1], x[2]))        return tuple((pos, name) for _, name, pos in seq)    best_oriented = None    best_score = None    for oriented in enumerate_cycle_numberings(cycle, start_atom):        score = (            tuple(i + 1 for i, a in enumerate(oriented) if a in carbaldehyde_carbons),            tuple(i + 1 for i, a in enumerate(oriented) if a in ketone_carbons),            substituent_locants(oriented),            substituent_alpha_sequence(oriented),        )        if best_score is None or score < best_score:            best_score = score            best_oriented = oriented    return best_orienteddef needs_parentheses(name: str) -> bool:    if name == "hydroxymethyl":        return False      if "," in name:        return True    if "-" in name:        parts = name.split("-")        if any(part.isdigit() or (len(part) > 1 and part[0].isdigit()) for part in parts):            return True        return False    return FalseVOWEL_STARTING_SUFFIXES = (    "ol", "al", "one", "oic", "amine", "amide", "thiol", "hydroxy")def elide_unsaturation_e(name: str) -> str:    if "benzene" in name:        return name    for suf in VOWEL_STARTING_SUFFIXES:        name = re.sub(            rf"ene(-\d+)?-{suf}",            lambda m: f"en{m.group(1) or ''}-{suf}",            name        )        name = re.sub(            rf"yne(-\d+)?-{suf}",            lambda m: f"yn{m.group(1) or ''}-{suf}",            name        )    return namedef tree_to_iupac(root):    return elide_unsaturation_e(iupac_name(root))HALOGEN = {'F': 'fluoro', 'Cl': 'chloro', 'Br': 'bromo', 'I': 'iodo'}MULTIPLIER = {2: 'di', 3: 'tri', 4: 'tetra', 5: 'penta', 6: 'hexa', 7: 'hepta', 8: 'octa', 9: 'nona', 10: 'deca'}ALKANE_STEM = {    1: 'meth', 2: 'eth', 3: 'prop', 4: 'but', 5: 'pent',    6: 'hex', 7: 'hept', 8: 'oct', 9: 'non', 10: 'dec'}def _build_substituent_name(child: "TreeNode", graph: "GraphNode" = None) -> str:    hal_count = defaultdict(list)    other_children = []    for grand in getattr(child, "children", []):        if grand.label == "halogen":            if hasattr(grand, "atom"):                element = grand.atom            elif graph is not None:                element = graph.nodes[grand.nodes[0]]            else:                raise ValueError("Cannot determine halogen element. Pass `graph` or set grand.atom.")            hal_count[element].append(grand.pos)        else:            other_children.append(grand)    hal_parts = []    for element in sorted(hal_count, key=lambda x: HALOGEN[x]):        positions = sorted(hal_count[element])        count = len(positions)        mult = MULTIPLIER[count] if count > 1 else ""        pos_str = ','.join(map(str, positions))        hal_parts.append(f"{pos_str}-{mult}{HALOGEN[element]}")    hal_prefix = "".join(hal_parts)    if child.label == "cycle":        if child.chain_length == 6 and getattr(child, "is_cyclic", False):            if len(child.bonds) == 6 and all(b in (1, 2) for b in child.bonds) and child.bonds.count(2) == 3:                base = "phenyl"            else:                base = f"cyclo{ALKANE_STEM[child.chain_length]}yl"        else:            base = f"cyclo{ALKANE_STEM[child.chain_length]}yl"    elif child.chain_length == 1 and child.label == "mainchain":        base = "methyl"    else:        base = f"{ALKANE_STEM[child.chain_length]}yl"    name = hal_prefix + base if hal_prefix else base    if other_children:        inner_parts = [_build_substituent_name(inner, graph) for inner in other_children]        name = f"({name}){''.join(inner_parts)}"    else:        if hal_prefix and child.label == "cycle":            name = f"({name})"    return namedef iupac_name(root: "TreeNode") -> str:    is_cyclic = getattr(root, "is_cyclic", False)    is_benzene = (        is_cyclic and root.chain_length == 6 and        all(b in (1, 2) for b in root.bonds) and root.bonds.count(2) == 3    )    double_pos = sorted(i + 1 for i, b in enumerate(root.bonds) if b == 2)    triple_pos = sorted(i + 1 for i, b in enumerate(root.bonds) if b == 3)    unsat_parts = []    if not is_benzene:        if double_pos:            mult = MULTIPLIER[len(double_pos)] if len(double_pos) > 1 else ""            unsat_parts.append(f"{','.join(map(str, double_pos))}-{mult}en")        if triple_pos:            mult = MULTIPLIER[len(triple_pos)] if len(triple_pos) > 1 else ""            unsat_parts.append(f"{','.join(map(str, triple_pos))}-{mult}yn")    unsaturation = "-".join(unsat_parts) if unsat_parts else ""    acid_children = [c for c in root.children if c.label == "carboxylic_acid"]    aldehyde_children = [c for c in root.children if c.label in ("aldehyde")]    carbaldehyde_children = [c for c in root.children if c.label in ("carbaldehyde")]    ketone_children = [c for c in root.children if c.label == "ketone"]    alcohol_children = [c for c in root.children if c.label == "alcohol"]    cyano_children = [c for c in root.children if c.label == "cyano"]    acid_pos = sorted(c.pos for c in acid_children)    aldehyde_pos = sorted(c.pos for c in aldehyde_children)    carbaldehyde_pos = sorted(c.pos for c in carbaldehyde_children)    ketone_pos = sorted(c.pos for c in ketone_children)    alcohol_pos = sorted(c.pos for c in alcohol_children)    cyano_pos = sorted(c.pos for c in cyano_children)    has_acid = bool(acid_pos)    has_higher = has_acid or bool(aldehyde_pos)    alcohol_is_prefix = bool(alcohol_pos) and (is_benzene or has_higher or bool(ketone_pos))    prefix_dict = defaultdict(list)    if alcohol_is_prefix:        prefix_dict["hydroxy"].extend(alcohol_pos)    for child in root.children:        if child.label == "halogen":            prefix_dict[HALOGEN[child.atom]].append(child.pos)    for pos in cyano_pos:        prefix_dict["cyano"].append(pos)    for child in root.children:        if child.label == "nitro":            prefix_dict["nitro"].append(child.pos)    for child in root.children:        if child.label == "exocyclic_unsat":            bond = getattr(child, "exo_bond", 1)            stem = ALKANE_STEM.get(child.chain_length, "alk")              if bond == 2:                prefix_name = f"{stem}ylidene"            elif bond == 3:                prefix_name = f"{stem}ylidyne"            else:                prefix_name = f"{stem}yl"              prefix_dict[prefix_name].append(child.pos)    for child in root.children:        if child.label in ("mainchain", "cycle"):            sub_name = _build_substituent_name(child)            prefix_dict[sub_name].append(child.pos)    prefix_parts = []    for name in sorted(prefix_dict, key=str.lower):        pos_list = sorted(prefix_dict[name])        mult = MULTIPLIER[len(pos_list)] if len(pos_list) > 1 else ""        prefix_parts.append(f"{','.join(map(str, pos_list))}-{mult}{name}")    prefixes = "-".join(prefix_parts)    if is_benzene and len(prefix_parts) == 1 and prefix_parts[0].startswith("1-"):        prefixes = prefix_parts[0][2:]    core_parts = []    if is_benzene:        core_parts.append("benzene")    else:        has_suffix = bool(acid_pos or aldehyde_pos or ketone_pos or (alcohol_pos and not alcohol_is_prefix))        if is_cyclic:            cyclo_prefix = "cyclo"            if has_suffix or unsaturation:                if unsaturation:                    stem = f"{cyclo_prefix}{ALKANE_STEM[root.chain_length]}"                else:                    stem = f"{cyclo_prefix}{ALKANE_STEM[root.chain_length]}an"            else:                stem = f"{cyclo_prefix}{ALKANE_STEM[root.chain_length]}ane"            core_parts.append(stem)        else:            if has_suffix or unsaturation:                if unsaturation:                    stem = ALKANE_STEM[root.chain_length]                else:                    stem = ALKANE_STEM[root.chain_length] + "an"            else:                stem = ALKANE_STEM[root.chain_length] + "ane"            core_parts.append(stem)        if unsaturation:            core_parts.append(unsaturation)    suffix = ""    if has_acid:        if len(acid_pos) == 1:            suffix = "oic acid"        else:            mult = MULTIPLIER[len(acid_pos)] if len(acid_pos) > 1 else ""            locs = ','.join(map(str, acid_pos))            suffix = f"{locs}-{mult}dioic acid"    elif aldehyde_pos:        mult = MULTIPLIER[len(aldehyde_pos)] if len(aldehyde_pos) > 1 else ""        if len(aldehyde_pos) == 1 and aldehyde_pos[0] == 1:            suffix = mult + "al"        else:            locs = ','.join(map(str, aldehyde_pos))            suffix = f"{locs}-{mult}al"    elif ketone_pos:        mult = MULTIPLIER[len(ketone_pos)] if len(ketone_pos) > 1 else ""        locs = ','.join(map(str, ketone_pos))        suffix = f"{locs}-{mult}one"    elif alcohol_pos and not alcohol_is_prefix:        mult = MULTIPLIER[len(alcohol_pos)] if len(alcohol_pos) > 1 else ""        locs = ','.join(map(str, alcohol_pos))        suffix = f"{locs}-{mult}ol"    elif carbaldehyde_pos:        mult = MULTIPLIER[len(carbaldehyde_pos)] if len(carbaldehyde_pos) > 1 else ""        if len(carbaldehyde_pos) == 1 and carbaldehyde_pos[0] == 1:            suffix = mult + "carbaldehyde"        else:            locs = ','.join(map(str, carbaldehyde_pos))            suffix = f"{locs}-{mult}carbaldehyde"    core = "-".join(core_parts) + (f"-{suffix}" if suffix else "")    core = core.replace("en-al", "enal").replace("yn-al", "ynal").replace("en-one", "enone").replace("yn-one", "ynone")    if prefixes:        return f"{prefixes}-{core}"    return coredef remove_unnecessary_hyphens(name: str) -> str:    parts = name.split("-")    if len(parts) == 1:        return name    out = parts[0]    for i in range(1, len(parts)):        left = parts[i - 1]        right = parts[i]        if any(c.isdigit() for c in left) or any(c.isdigit() for c in right):            out += "-" + right        else:            out += right    return outdef convert_carbaldehyde_nodes(root: TreeNode):    new_children = []    for child in root.children:        convert_carbaldehyde_nodes(child)        if child.label == "mainchain" and child.chain_length == 1:            aldehyde_child = None            for gc in child.children:                if gc.label == "aldehyde":                    aldehyde_child = gc                    break            if aldehyde_child:                carbal_node = TreeNode(                    pos=child.pos,                    chain_length=1,                    nodes=child.nodes[:],                    label="carbaldehyde",                    bonds=[]                )                new_children.append(carbal_node)                continue          new_children.append(child)    root.children = new_childrendef graphnode_to_rdkit_mol(graph):    rw_mol = Chem.RWMol()    id_map = {}    charges = getattr(graph, "charges", {})    radicals = getattr(graph, "radical", {})    for node_id, atom_symbol in graph.nodes.items():        atom = Chem.Atom(atom_symbol)        ch = charges.get(node_id, 0)        if ch != 0:            atom.SetFormalCharge(int(ch))        rad = radicals.get(node_id, 0)        if rad:            atom.SetNumRadicalElectrons(int(rad))        atom.SetNumExplicitHs(0)        atom.SetNoImplicit(False)           idx = rw_mol.AddAtom(atom)        id_map[node_id] = idx    added = set()    for i, neighbors in graph.edges.items():        for j, data in neighbors.items():            if (j, i) in added:                continue            bond_order = data.get("bond", 1)            bond_type = {                1: Chem.BondType.SINGLE,                2: Chem.BondType.DOUBLE,                3: Chem.BondType.TRIPLE            }.get(bond_order, Chem.BondType.SINGLE)            rw_mol.AddBond(id_map[i], id_map[j], bond_type)            added.add((i, j))    mol = rw_mol.GetMol()    try:        Chem.SanitizeMol(            mol,            sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL            ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES        )    except Exception as e:        print("Warning: skipped valence sanitization:", e)    return moldef graphnode_to_smiles(graph, canonical=True):    mol = graphnode_to_rdkit_mol(graph)    return Chem.MolToSmiles(        mol,        canonical=canonical,        allHsExplicit=False       )def smiles_to_graphnode(smiles: str) -> GraphNode:    mol = Chem.MolFromSmiles(smiles)    if mol is None:        raise ValueError(f"Invalid SMILES string: {smiles}")    Chem.Kekulize(mol, clearAromaticFlags=True)    graph = GraphNode()    idx_map = {}    for atom in mol.GetAtoms():        symbol = atom.GetSymbol()          charge = atom.GetFormalCharge()        radical = atom.GetNumRadicalElectrons()        node_id = graph.add_node(            atom=symbol,            tags=set(),            charge=charge,            radical=radical        )        idx_map[atom.GetIdx()] = node_id    for bond in mol.GetBonds():        i = idx_map[bond.GetBeginAtomIdx()]        j = idx_map[bond.GetEndAtomIdx()]        bt = bond.GetBondType()        if bt == Chem.BondType.SINGLE:            order = 1        elif bt == Chem.BondType.DOUBLE:            order = 2        elif bt == Chem.BondType.TRIPLE:            order = 3        else:            order = 1          tags = set()        if bond.GetIsAromatic():            tags.add("aromatic")          graph.add_edge(i, j, bond=order, tags=tags)    calculate_electron_state(graph)    return graphdef draw_graph_with_rdkit(graph, filename="compound.png", size=(600, 400)):    rw_mol = Chem.RWMol()    atom_map = {}    for node_id, atom_symbol in graph.nodes.items():        symbol = atom_symbol if atom_symbol in {"Cl", "Br", "I", "F"} else atom_symbol.upper()        atom = Chem.Atom(symbol)        if atom_symbol.islower() and atom_symbol not in {"c", "n", "o"}:              atom.SetIsAromatic(True)        atom_map[node_id] = rw_mol.AddAtom(atom)    added = set()    for i, nbrs in graph.edges.items():        for j, data in nbrs.items():            key = tuple(sorted((i, j)))            if key in added:                continue            bond_order = data.get("bond", 1)            if "aromatic" in data.get("tags", set()):                bond_type = Chem.BondType.AROMATIC            else:                bond_type = {1: Chem.BondType.SINGLE,                             2: Chem.BondType.DOUBLE,                             3: Chem.BondType.TRIPLE}.get(bond_order, Chem.BondType.SINGLE)            rw_mol.AddBond(atom_map[i], atom_map[j], bond_type)            added.add(key)    mol = rw_mol.GetMol()    try:        Chem.SanitizeMol(mol)    except Exception as e:        print("Sanitization failed:", e)    AllChem.Compute2DCoords(mol)    img = Draw.MolToImage(mol, size=size, kekulize=False, wedgeBonds=True)    img.save(filename)    print(f"Saved {filename}")def functional_group_distances(root: "TreeNode", target_label: str):    FUNCTIONAL_GROUP_LABELS = {        "carboxylic_acid",        "aldehyde",        "ketone",        "alcohol",        "cyano",        "nitro",        "chloro",        "fluoro",        "charged_carbon_1",        "charged_carbon_-1"    }    parent = {}    def build_parent(node):        for child in getattr(node, "children", []):            parent[child] = node            build_parent(child)    build_parent(root)    functional_nodes = []    def collect(node):        if helper(node) in FUNCTIONAL_GROUP_LABELS:            functional_nodes.append(node)        for c in getattr(node, "children", []):            collect(c)    collect(root)    targets = [n for n in functional_nodes if helper(n) == target_label]    results = []    def path_to_root(node):        p = []        while node:            p.append(node)            node = parent.get(node)        return p    for t in targets:        path_t = path_to_root(t)        for other in functional_nodes:            if other is t:                continue            path_o = path_to_root(other)            lca = next((n for n in path_t if n in path_o), None)            if lca and lca.label in ("mainchain", "cycle"):                dist = abs(t.pos - other.pos) + 1            else:                dist = path_t.index(lca) + path_o.index(lca)            results.append({                "to_label": helper(other),                "distance": dist            })    return resultsdef helper(x):    if x.label == "halogen":        return HALOGEN[x.atom]    return "charged_carbon_" + str(x.charge) if x.label == "charged_carbon" else x.labeldef group_halogens(fg_distances):    grouped = defaultdict(int)    for acid, symbol, dist in fg_distances:        grouped[(acid, symbol, dist)] += 1    result = []    for (acid, symbol, dist), count in grouped.items():        new_label = symbol        if count > 1:            new_label = f"{count}-{symbol}"        result.append((acid, new_label, dist))    return resultdef build_tree(graph):    tmp = build_tree_recursive(graph)    normalize_carboxylic_acids(tmp)    convert_carbaldehyde_nodes(tmp)    return tmpdef all_atoms_neutral(graph):    if not hasattr(graph, "charges"):        return True      return all(charge == 0 for charge in graph.charges.values())def count_pi_bonds(graph):    counted = set()    pi_count = 0    for i, neighbors in graph.edges.items():        for j, data in neighbors.items():            if (j, i) in counted:                continue              bond_order = data.get("bond", 1)            if bond_order == 2:                pi_count += 1            elif bond_order == 3:                pi_count += 2            counted.add((i, j))    return pi_countdef get_charged_atoms(graph):    charged_atoms = []    for atom_id, atom_symbol in graph.nodes.items():        ch = graph.charges.get(atom_id, 0)        if ch != 0:            charged_atoms.append((atom_symbol, ch))    return charged_atomsdef find_internal_charge_pairs(graph: "GraphNode"):    pairs = []    seen = set()    charges = getattr(graph, "charges", {})    lone_pairs = getattr(graph, "lone_pairs", {})    positives = []    negatives = []    lp_atoms = []    for atom_id, sym in graph.nodes.items():        ch = charges.get(atom_id, 0)        lp = lone_pairs.get(atom_id, 0)        if ch > 0:            positives.append((atom_id, sym, ch))        elif ch < 0:            negatives.append((atom_id, sym, ch))        if lp > 0 and sym.upper() != "C":            lp_atoms.append((atom_id, sym, lp))    def bfs_distance(start, goal):        visited = set()        queue = deque([(start, 0)])        while queue:            node, dist = queue.popleft()            if node == goal:                return dist            if node in visited:                continue            visited.add(node)            for nbr in graph.edges.get(node, {}):                if nbr not in visited:                    queue.append((nbr, dist + 1))        return float("inf")    def add_pairs(list1, list2, label):        for a_id, a_sym, a_val in list1:            for b_id, b_sym, b_val in list2:                if a_id == b_id:                    continue                key = tuple(sorted((a_id, b_id))) + (label,)                if key in seen:                    continue                seen.add(key)                dist = bfs_distance(a_id, b_id)                pairs.append((dist, a_sym, b_sym, a_val, b_val, label))    add_pairs(positives, negatives, "positive_negative")    add_pairs(positives, lp_atoms, "positive_lone_pair")    add_pairs(positives, positives, "positive_positive")    add_pairs(negatives, negatives, "negative_negative")    add_pairs(negatives, lp_atoms, "negative_lone_pair")    add_pairs(lp_atoms, lp_atoms, "lone_pair_lone_pair")    pairs.sort(key=lambda x: x[0])    return pairsdef condense_functional_groups(graph: "GraphNode", allow=[True,True,True,True,True]) -> "GraphNode":    def condense_oh(g):        for o_id, sym in list(g.nodes.items()):            if sym != "O":                continue            neighbors = list(g.edges.get(o_id, {}).items())            if len(neighbors) != 1:                continue            ext, data = neighbors[0]            if data.get("bond", 1) != 1:                continue            if g.charges.get(o_id, 0) != 0:                continue            new = g.add_node("OH", tags={"condensed"})            g.charges[new] = 0            g.lone_pairs[new] = 0            g.radicals[new] = 0            g.add_edge(new, ext, bond=1)            g.remove_node(o_id)    def condense_cooh(g):        for c_id, sym in list(g.nodes.items()):            if sym != "C":                continue            o_double = None            o_single = None            external = None            for nbr, e in g.edges.get(c_id, {}).items():                bond = e.get("bond", 1)                if g.nodes[nbr] == "O" and bond == 2:                    o_double = nbr                elif g.nodes[nbr] == "O" and bond == 1:                    o_single = nbr                else:                    external = nbr            if not (o_double and o_single and external):                continue            if g.charges.get(o_single, 0) != 0:                continue            new = g.add_node("COOH", tags={"condensed"})            g.charges[new] = 0            g.lone_pairs[new] = 0            g.radicals[new] = 0            g.add_edge(new, external, bond=g.edges[c_id][external]["bond"])            for x in (c_id, o_double, o_single):                g.remove_node(x)    def find_nitro_groups(g):        out = []        for n_id, sym in g.nodes.items():            if sym != "N":                continue            o_ids = []            orders = []            for nbr, e in g.edges[n_id].items():                if g.nodes[nbr] == "O":                    o_ids.append(nbr)                    orders.append(e.get("bond", 1))            if len(o_ids) == 2 and sorted(orders) == [1, 2]:                out.append((n_id, o_ids))        return out    def condense_no2(g):        for n_id, o_ids in find_nitro_groups(g):            external = None            for nbr in g.edges[n_id]:                if nbr not in o_ids:                    external = nbr                    break            new = g.add_node("NO2", tags={"condensed"})            g.charges[new] = 0            g.lone_pairs[new] = 0            g.radicals[new] = 0            if external is not None:                bond = g.edges[n_id][external]["bond"]                g.add_edge(new, external, bond=bond)            for x in o_ids + [n_id]:                g.remove_node(x)    def condense_ccl3(g):        for c_id, sym in list(g.nodes.items()):            if sym != "C":                continue            cl = []            external = None            for nbr, e in g.edges.get(c_id, {}).items():                if g.nodes[nbr] == "Cl" and e.get("bond", 1) == 1:                    cl.append(nbr)                else:                    external = nbr            if len(cl) != 3:                continue            new = g.add_node("CCl3", tags={"condensed"})            g.charges[new] = 0            g.lone_pairs[new] = 0            g.radicals[new] = 0            if external is not None:                bond = g.edges[c_id][external]["bond"]                g.add_edge(new, external, bond=bond)            for x in cl + [c_id]:                g.remove_node(x)    def condense_och3(g):        for o_id, sym in list(g.nodes.items()):            if sym != "O":                continue            neighbors = list(g.edges.get(o_id, {}).items())            if len(neighbors) != 2:                continue              main_ext = None            methyl_c = None            for nbr, data in neighbors:                if g.nodes[nbr] == "C" and len(g.edges.get(nbr, {})) == 1:                    methyl_c = nbr                else:                    main_ext = nbr            if not (main_ext and methyl_c):                continue            new = g.add_node("OCH3", tags={"condensed"})            g.charges[new] = 0            g.lone_pairs[new] = 0            g.radicals[new] = 0            g.add_edge(new, main_ext, bond=g.edges[o_id][main_ext]["bond"])            g.remove_node(o_id)            g.remove_node(methyl_c)    g = graph.copy()    changed = True    while changed:        before = len(g.nodes)        if allow[0]:            condense_cooh(g)        if allow[1]:            condense_no2(g)        if allow[2]:            condense_ccl3(g)        if allow[3]:            condense_oh(g)        if len(allow) > 4 and allow[4]:            condense_och3(g)        changed = len(g.nodes) != before    return gdef distances_from_acidic_groups(graph: "GraphNode"):    results = []    sources = [        (aid, sym)        for aid, sym in graph.nodes.items()        if sym in {"COOH", "OH"}    ]    if not sources:        return []    halogens = {"F", "Cl", "Br", "I"}    targets = []    for aid, sym in graph.nodes.items():        if sym in halogens:            targets.append((aid, sym))        elif "condensed" in graph.node_tags.get(aid, set()):            targets.append((aid, sym))    target_ids = {aid for aid, _ in targets}    def bfs_all_distances(start):        dist = {start: 0}        q = deque([start])        while q:            u = q.popleft()            for v in graph.edges.get(u, {}):                if v not in dist:                    dist[v] = dist[u] + 1                    q.append(v)        return dist    for src_id, src_sym in sources:        dist_map = bfs_all_distances(src_id)        for tgt_id, tgt_sym in targets:            if tgt_id == src_id:                continue            if tgt_id in dist_map:                results.append(                    (src_sym, tgt_sym, dist_map[tgt_id])                )    results.sort(key=lambda x: (x[0], x[2]))    return resultsdef print_graphnode(graph: "GraphNode"):    print("=== GraphNode ===")    print("Nodes:")    for node_id, sym in graph.nodes.items():        ch = getattr(graph, "charges", {}).get(node_id, 0)        rad = getattr(graph, "radicals", {}).get(node_id, 0)        lp = getattr(graph, "lone_pairs", {}).get(node_id, 0)        tags = graph.node_tags.get(node_id, set())        print(f"  {node_id}: {sym}, charge={ch}, radical={rad}, lone_pairs={lp}, tags={tags}")    print("\nEdges:")    for i, nbrs in graph.edges.items():        for j, data in nbrs.items():            bond = data.get("bond", 1)            tags = data.get("tags", set())            print(f"  {i} - {j}, bond={bond}, tags={tags}")    print("================\n")def identify_ortho_meta_para_graph(graph: "GraphNode"):    ring = None    for n in graph.nodes:        if graph.nodes[n] != "C":            continue        neighbors = [nbr for nbr in graph.edges[n] if graph.nodes[nbr] == "C"]        if len(neighbors) != 2:            continue        visited = [n]        current = neighbors[0]        prev = n        while len(visited) < 6:            visited.append(current)            next_c = [nbr for nbr in graph.edges[current] if graph.nodes[nbr] == "C" and nbr != prev]            if not next_c:                break            prev, current = current, next_c[0]        if len(visited) == 6 and all(graph.nodes[x] == "C" for x in visited):            ring = visited            break    if not ring:        return None    ring_set = set(ring)    ring_len = 6    ref_atom = None    for sub_id, sym in graph.nodes.items():        if sym not in {"OH", "COOH"}:            continue        for nbr in graph.edges[sub_id]:            if nbr in ring_set:                ref_atom = nbr                break        if ref_atom is not None:            break    if ref_atom is None:        return []    distances = {ref_atom: 0}    queue = deque([ref_atom])    while queue:        u = queue.popleft()        for v in graph.edges[u]:            if v in ring_set and v not in distances:                distances[v] = distances[u] + 1                queue.append(v)    results = []    for ring_atom in ring:        if ring_atom == ref_atom:            continue        for nbr in graph.edges[ring_atom]:            if nbr in ring_set:                continue            sym = graph.nodes[nbr]            if sym in {"Cl", "Br", "F", "I"} or "condensed" in graph.node_tags.get(nbr, set()):                d = distances.get(ring_atom)                if d is None:                    continue                d = min(d, ring_len - d)                if d == 1:                    rel = "ortho"                elif d == 2:                    rel = "meta"                elif d == 3:                    rel = "para"                else:                    continue                results.append((rel, sym))    return resultsdef condense_ch3(graph: "GraphNode") -> "GraphNode":    g = graph.copy()    for c_id, sym in list(g.nodes.items()):        if sym != "C":            continue        neighbors = list(g.edges.get(c_id, {}).items())        if len(neighbors) != 1:            continue        ext, data = neighbors[0]        if data.get("bond", 1) != 1:            continue        if g.nodes[ext] in {"O", "N", "S"}:            continue        new_id = g.add_node("CH3", tags={"condensed"})        g.charges[new_id] = 0        g.radicals[new_id] = 0        g.lone_pairs[new_id] = 0        g.add_edge(new_id, ext, bond=1)        g.remove_node(c_id)    return gdef inductive_effect_acid(fg_dist_a, fg_dist_b):    INDUCTIVE_STRENGTH = {        "NO2": 5,        "CN": 4,        "F": 3,        "Cl": 2,        "Br": 1.5,        "I": 1,        "2-Cl": 3.25,        "3-Cl": 3.5,        "CCl3": 3.5    }    sgn = 1    if len(fg_dist_a)+len(fg_dist_b) not in [1,2] or abs(len(fg_dist_a)-len(fg_dist_b)) > 1:        return 0    if len(fg_dist_a)==len(fg_dist_b):        if fg_dist_a[0][2] == fg_dist_b[0][2]:            if fg_dist_a[0][1] == fg_dist_b[0][1]:                return 0            if INDUCTIVE_STRENGTH.get(fg_dist_a[0][1], 1) > INDUCTIVE_STRENGTH.get(fg_dist_b[0][1], 1):                return 1            return -1        elif fg_dist_a[0][1] == fg_dist_b[0][1]:            sgn2 = 1 if INDUCTIVE_STRENGTH.get(fg_dist_a[0][1], 1) > 0 else -1            if fg_dist_a[0][2] > fg_dist_b[0][2]:                return sgn2            return -sgn2        else:            return 0    elif len(fg_dist_a)==1:        if INDUCTIVE_STRENGTH.get(fg_dist_a[0][1], 1) > 0:            return 1        return -1    elif len(fg_dist_b)==1:        if INDUCTIVE_STRENGTH.get(fg_dist_b[0][1], 1) > 0:            return -1        return 1    return 0def compare_acidic_strength(graph_a: "GraphNode", graph_b: "GraphNode") -> int:    con_a = condense_functional_groups(graph_a)    con_b = condense_functional_groups(graph_b)    orig_a = con_a.copy()    orig_b = con_b.copy()    con_a = condense_ch3(con_a)    con_b = condense_ch3(con_b)    fg_dist_a = group_halogens(distances_from_acidic_groups(con_a))    fg_dist_b = group_halogens(distances_from_acidic_groups(con_b))    cy_a = identify_ortho_meta_para_graph(con_a)    cy_b = identify_ortho_meta_para_graph(con_b)    if cy_a is not None and cy_b is not None:        cy = Counter(cy_a) & Counter(cy_b)        cy_a = list(Counter(cy_a) - cy)        cy_b = list(Counter(cy_b) - cy)        if len(cy_a) == 1 and len(cy_b) == 1 and cy_a[0][0] == cy_b[0][0] and cy_a[0][0] != "meta" and cy_a[0][1] in ["F", "Cl", "Br", "I"] and\           cy_b[0][1] in ["F", "Cl", "Br", "I"]:            return -inductive_effect_acid(fg_dist_a, fg_dist_b)        if len(cy_a) == 1 and len(cy_b) == 1 and cy_a[0][1] == cy_b[0][1]:            if cy_a[0][1] == "OCH3":                score = {"meta":3, "ortho":2, "para":1}                s_a = score[cy_a[0][0]]                s_b = score[cy_b[0][0]]                if s_a > s_b:                    return 1                if s_a < s_b:                    return -1            if cy_a[0][0] == "ortho":                return 1            if cy_b[0][0] == "ortho":                return -1        lst = []        for item in [cy_a, cy_b]:            other = (None, None)            for item2 in item:                if item2[0] != "meta":                    if item2[1] == "NO2":                        other = ("-M", "-I")                    elif item2[1] == "CCl3":                        other = ("-I", "-M")                    elif item2[1] == "CH3":                        other = ("+H", "+I")                    elif item2[1] == "OCH3":                        other = ("+M", "-I")                    elif item2[1] in ["Cl", "F", "Br", "I"]:                        other = ("-I", "+M")                else:                    if item2[1] == "NO2":                        other = ("-I", None)                    elif item2[1] == "CCl3":                        other = ("-I", None)                    elif item2[1] == "CH3":                        other = ("+H", "+I")                    elif item2[1] == "OCH3":                        other = ("-I", None)                    elif item2[1] in ["Cl", "F", "Br", "I"]:                        other = ("-I", None)            lst.append(other)        effect_a = lst[0]        effect_b = lst[1]        def score(x):            if x is None:                return 0            sgn = -1            if x[0] == "-":                sgn = 1            return sgn * "k I H M".split(" ").index(x[1])        for i in range(2):            if score(effect_a[i]) > score(effect_b[i]):                return 1            elif score(effect_a[i]) < score(effect_b[i]):                return -1            if effect_a[i] in ["+I", "-I"]:                return inductive_effect_acid(fg_dist_a, fg_dist_b)            if i == 0 and effect_a[i] == "-M" and len(cy_a) == 1 and len(cy_b) == 1 and cy_a[0][1] == "NO2" and cy_b[0][1] == "NO2":                if cy_a[0][0] == "para":                    return 1                if cy_b[0][0] == "para":                    return -1    fg_dist_a = group_halogens(distances_from_acidic_groups(orig_a))    fg_dist_b = group_halogens(distances_from_acidic_groups(orig_b))    return inductive_effect_acid(fg_dist_a, fg_dist_b)def compare_stability(graph_a: "GraphNode", graph_b: "GraphNode") -> int:    if all_atoms_neutral(graph_a) and not all_atoms_neutral(graph_b):        return 1    if not all_atoms_neutral(graph_a) and all_atoms_neutral(graph_b):        return -1    if count_pi_bonds(graph_a) > count_pi_bonds(graph_b):        return 1    if count_pi_bonds(graph_a) < count_pi_bonds(graph_b):        return -1    ca = set(get_charged_atoms(graph_a))    cb = set(get_charged_atoms(graph_b))    c = ca & cb    ca = list(ca - c)    cb = list(cb - c)    stability_score = {"C":1, "N":2, "O":3, "S":4}    def c_score(ca, cb, index_a, index_b):        if ca[index_a][1] == cb[index_b][1] and ca[index_a][0] != cb[index_b][0]:            if ca[index_a][1] == 0:                return 0            sgn = -1 if ca[index_a][1] < 0 else 1            if stability_score[ca[index_a][0]] > stability_score[cb[index_b][0]]:                return -sgn            if stability_score[ca[index_a][0]] < stability_score[cb[index_b][0]]:                return sgn        return 0    if len(ca) == len(cb):        if len(ca) == 2:            for item in [((1,1),(2,2)),((1,2),(2,1))]:                tmp = set([c_score(ca, cb, item2[0]-1, item2[1]-1) for item2 in item])                if 0 not in tmp and len(tmp) == 1:                    return list(tmp)[0]        elif len(ca) == 1:            tmp = c_score(ca, cb, 0, 0)            if tmp != 0:                return tmp    for item in ["positive_negative","positive_lone_pair","positive_positive","negative_negative","negative_lone_pair","lone_pair_lone_pair"]:        sa = find_internal_charge_pairs(graph_a)        sb = find_internal_charge_pairs(graph_b)        sa, sb = [set([item3 for item3 in item2 if item3[-1] == item]) for item2 in [sa, sb]]        s = sa & sb        sa = list(sa - s)        sb = list(sb - s)        if len(sa) == 1 and len(sb) == 1 and all(sa[0][i] == sb[0][i] for i in range(1,len(sa[0]))):            sgn = 1            if item in ["positive_negative","positive_lone_pair"]:                sgn = -1            if sa[0][0] < sb[0][0]:                return sgn            if sa[0][0] > sb[0][0]:                return -sgn    ha = count_hyperconjugation(graph_a)    hb = count_hyperconjugation(graph_b)    if ha > hb:        return 1    elif ha < hb:        return -1    tree_a = build_tree(graph_a)    tree_b = build_tree(graph_b)    acid_labels = {"charged_carbon"}    acids_a = [c for c in tree_a.children if c.label in acid_labels]    acids_b = [c for c in tree_b.children if c.label in acid_labels]    if not acids_a or not acids_b:        return 0    type_a = helper(acids_a[0])    type_b = helper(acids_b[0])    if type_a != type_b:        return 0    fg_dist_a = group_halogens(functional_group_distances(tree_a, target_label=type_a))    fg_dist_b = group_halogens(functional_group_distances(tree_b, target_label=type_b))    INDUCTIVE_STRENGTH = {        "nitro": 5,        "cyano": 4,        "fluoro": 3,        "chloro": 2,        "bromo": 1.5,        "iodo": 1,        "dichloro": 3.25    }    sgn = 1    if type_a == "charged_carbon_-1":        sgn = -1    if len(fg_dist_a)+len(fg_dist_b) not in [1,2] or abs(len(fg_dist_a)-len(fg_dist_b)) > 1:        return 0    if len(fg_dist_a)==len(fg_dist_b):        if fg_dist_a[0]["distance"] == fg_dist_b[0]["distance"]:            if fg_dist_a[0]["to_label"] == fg_dist_b[0]["to_label"]:                return 0            if INDUCTIVE_STRENGTH.get(fg_dist_a[0]["to_label"], 1) > INDUCTIVE_STRENGTH.get(fg_dist_b[0]["to_label"], 1):                return -sgn            return sgn        elif fg_dist_a[0]["to_label"] == fg_dist_b[0]["to_label"]:            sgn2 = 1 if INDUCTIVE_STRENGTH.get(fg_dist_a[0]["to_label"], 1) > 0 else -1            if fg_dist_a[0]["distance"] > fg_dist_b[0]["distance"]:                return sgn * sgn2            return -sgn * sgn2        else:            return 0def is_carbon(graph, n):    return graph.nodes[n].upper() == "C"def is_acceptor_center(graph, n):    if graph.charges.get(n, 0) > 0:        return True    if graph.radicals.get(n, 0) > 0:        return True    for nbr, data in graph.edges[n].items():        if data.get("bond", 1) >= 2:            return True    return Falsedef count_hyperconjugation(graph, include_CC=False):    count = 0    for acc in graph.nodes:        if not is_carbon(graph, acc):            continue        if not is_acceptor_center(graph, acc):            continue        for beta, data in graph.edges[acc].items():            if not is_carbon(graph, beta):                continue            h_count = graph.attached_h.get(beta, 0)            count += h_count            if include_CC:                for nbr2, data2 in graph.edges[beta].items():                    if nbr2 == acc:                        continue                    if is_carbon(graph, nbr2) and data2.get("bond", 1) == 1:                        count += 1    return countdef custom_sort(items, cmp):    labels = {obj: string.ascii_lowercase[i] for i, obj in enumerate(items)}    score = {obj: 0 for obj in items}    for a in items:        for b in items:            if a is b:                continue            c = cmp(a, b)            if c == 1:                score[a] += 1                score[b] -= 1            elif c == -1:                score[a] -= 1                score[b] += 1    buckets = {}    for obj, s in score.items():        buckets.setdefault(s, []).append(labels[obj])    return [buckets[s] for s in sorted(buckets, reverse=True)]def iupac(graph, debug=False):    tmp = build_tree(graph)    if debug:        print(tmp)    return remove_unnecessary_hyphens(tree_to_iupac(tmp))def smiles(string):    return smiles_to_graphnode(string)def draw(graph, filename="compound.png", size=(300, 200)):    draw_graph_with_rdkit(graph, filename, size)def format_formula(counts, style="inorganic"):    def fmt(atom):        n = counts.get(atom, 0)        if n <= 0:            return None        return atom if n == 1 else f"{atom}{n}"    if style == "inorganic" and "C" not in counts:        parts = []        center_atom = None        for center in ("S", "P", "N", "C"):            if counts.get(center, 0) > 0:                center_atom = center                parts.append(fmt(center))                break        if center_atom is None:            for atom in sorted(counts):                f = fmt(atom)                if f:                    parts.append(f)            out = "".join(parts)            if out == "HO":                return "OH"            return out        for atom in sorted(a for a in counts if a != center_atom):            f = fmt(atom)            if f:                parts.append(f)        return "".join(parts)    parts = []    if counts.get("C", 0) > 0:        for atom in ("C", "H"):            f = fmt(atom)            if f:                parts.append(f)        for atom in sorted(a for a in counts if a not in ("C", "H")):            f = fmt(atom)            if f:                parts.append(f)    else:        for atom in sorted(counts):            f = fmt(atom)            if f:                parts.append(f)    return "".join(parts)def molecular_formula(graphnodes):    counts = []    for node in graphnodes:        for atom in node.nodes.values():            counts.append(atom)    return dict(Counter(counts))def total_charge(node: GraphNode) -> int:    return sum(node.charges.values())def molecular_equation(graphnodes):    counts = []    for node in graphnodes:        s = []        for atom in node.nodes.values():            s.append(atom)        counts.append(dict(Counter(s)))    a, b = None, 1    if len(graphnodes) == 2:        a, b = total_charge(graphnodes[0]), total_charge(graphnodes[1])        a, b = abs(a), abs(b)        a, b = round(a/gcd(a,b)), round(b/gcd(a,b))    out = []    for i in range(len(graphnodes)):        n = [b,a][i]                c = format_formula(counts[i])        if n > 1 and len([item for item in c if item.isupper()])>1:            c = f"({c}){n}"        elif n > 1:            c = f"{c}{n}"        out.append(c)    return "".join(out)class Molecule:    def __init__(self, ions):        self.ions = ions           self.sort_ion()    def __repr__(self):        return molecular_formula(self.ions)    def add_node(self, node):        self.ions.append(node)    def remove_node(self, node):        self.ions.remove(node)    def nodes(self):        return self.ions    def sort_ion(self):        if len(self.ions) == 2:            self.molecules = list(sorted(self.ions, key=total_charge))[::-1]    def net_charge(self) -> int:        return sum(node.charge for node in self.ions)    def charged_nodes(self):        return [n for n in self.ions if n.charge != 0]    def neutral_nodes(self):        return [n for n in self.ions if n.charge == 0]    def is_ionic(self) -> bool:        return any(n.charge != 0 for n in self.ions)    def __eq__(self, other):        for item in itertools.permutations(self.ions):            if all(item2[0] == item2[1] for item2 in zip(other.ions, item)):                return True        return False    def __contains__(self, item):        for x in self.items:            if x == item:                   return True        return False    def merge_nodes(self, node_a, node_b):        if node_a not in self.ions or node_b not in self.ions:            raise ValueError("Node not part of molecule")        node_a.atoms.extend(node_b.atoms)        node_a.bonds.extend(node_b.bonds)        node_a.charge += node_b.charge        self.remove_node(node_b)    def full_struct(self):        if len(self.ions) == 1:            return str(self.ions[0])        return "".join(["{"+str(item)+"}" for item in self.ions])    def __repr__(self):        return f"{molecular_equation(self.ions)}"def add_hydrogens(node):    if not hasattr(node, "attached_h"):        return node    for atom_index, h_count in list(node.attached_h.items()):        for _ in range(h_count):            h_index = node.add_node("H")            node.add_edge(atom_index, h_index, 1)        node.attached_h[atom_index] = 0    return nodedef remove_explicit_hydrogens(node):    if not hasattr(node, "attached_h"):        node.attached_h = {}    hydrogen_indices = [i for i, a in enumerate(node.atoms) if a == "H"]    if not hydrogen_indices:        return node    hydrogen_set = set(hydrogen_indices)    new_atoms = []    index_map = {}    for old_idx, atom in enumerate(node.atoms):        if old_idx not in hydrogen_set:            index_map[old_idx] = len(new_atoms)            new_atoms.append(atom)    for i, j, order in node.bonds:        if i in hydrogen_set and j not in hydrogen_set:            node.attached_h[j] = node.attached_h.get(j, 0) + 1        elif j in hydrogen_set and i not in hydrogen_set:            node.attached_h[i] = node.attached_h.get(i, 0) + 1    new_bonds = []    for i, j, order in node.bonds:        if i in hydrogen_set or j in hydrogen_set:            continue        new_bonds.append((index_map[i], index_map[j], order))    node.atoms = new_atoms    node.bonds = new_bonds    return nodedef hydrogen_molecule() -> GraphNode:    graph = GraphNode()    h1 = graph.add_node(        atom="H",        tags=set(),        charge=0,        radical=0    )    h2 = graph.add_node(        atom="H",        tags=set(),        charge=0,        radical=0    )    graph.add_edge(        h1,        h2,        bond=1,        tags=set()    )    calculate_electron_state(graph)    return Molecule([graph])def collect_elements(dicts):    elements = set()    for d in dicts:        elements |= set(d.keys())    return sorted(elements)def build_matrix(reactants, products):    all_dicts = reactants + products    elements = collect_elements(all_dicts)    matrix = []    for elem in elements:        row = []        for d in reactants:            row.append(d.get(elem, 0))        for d in products:            row.append(-d.get(elem, 0))        matrix.append(row)    return matrixdef rref(matrix):    M = [[Fraction(x) for x in row] for row in matrix]    rows = len(M)    cols = len(M[0])    r = 0    for c in range(cols):        if r >= rows:            break        pivot = None        for i in range(r, rows):            if M[i][c] != 0:                pivot = i                break        if pivot is None:            continue        M[r], M[pivot] = M[pivot], M[r]        pivot_val = M[r][c]        M[r] = [x / pivot_val for x in M[r]]        for i in range(rows):            if i != r and M[i][c] != 0:                factor = M[i][c]                M[i] = [M[i][j] - factor * M[r][j] for j in range(cols)]        r += 1    return Mdef extract_coeffs(rref_matrix):    cols = len(rref_matrix[0])    solution = [Fraction(0)] * cols    solution[-1] = 1      for row in reversed(rref_matrix):        leading = None        for i, val in enumerate(row):            if val == 1:                leading = i                break        if leading is None or leading == cols - 1:            continue        solution[leading] = -sum(            row[j] * solution[j] for j in range(leading + 1, cols)        )    lcm = 1    for x in solution:        lcm = lcm * x.denominator // gcd(lcm, x.denominator)    return [int(x * lcm) for x in solution]def gcd(a, b):    while b:        a, b = b, a % b    return adef balance(reactant_dicts, product_dicts):    M = build_matrix(reactant_dicts, product_dicts)    R = rref(M)    coeffs = extract_coeffs(R)    return coeffsdef make_hydroxide():    g = GraphNode()    o = g.add_node("O")    h = g.add_node("H")    g.add_edge(o, h, bond=1)    g.charges[o] = -1    return gclass ReactionSystem:    def __init__(self, molecules=[]):        self.molecules = molecules        self.history = []    def react(self, conditions=None):        if len(self.molecules) == 2 and len(self.molecules[0].ions) == 2 and len(self.molecules[0].ions) == 2:            s = []            for i in range(2):                for j in range(2):                    for k in range(2):                        if make_hydroxide() == self.molecules[i].ions[j] and smiles("[H+]") == self.molecules[1-i].ions[k]:                            s = [self.molecules[i].ions[1-j], self.molecules[1-i].ions[1-k]]                            break                if s != []:                    break            if s != []:                self.history.append(copy.deepcopy(self))                self.molecules = [Molecule(s), molec("O")]                return        if hydrogen_molecule() in self.molecules:            if Molecule([add_hydrogens(smiles("O=O"))]) in self.molecules:                self.history.append(copy.deepcopy(self))                self.molecules = [Molecule([add_hydrogens(smiles("O"))])]                return    def show(self, molecularfx=True):        s2 = []        lst = self.history+[copy.deepcopy(self)]        for i in range(len(lst)-1):            s = []            c = balance(*[[molecular_formula(item.ions) for item in lst[i+j].molecules] for j in range(2)])            for item in lst[i:i+2]:                s.append(" + ".join([str(c.pop(0)) + " " + (str(item) if molecularfx else item.full_struct()) for item in item.molecules]))            s2.append(" --> ".join(s).replace("1 ", ""))        return "\n".join(s2)    def __repr__(self):        return self.show(False)def molec(a, b=None):    lst = []    lst2 = [a,b]    if b is None:        lst2.pop(-1)    for item in lst2:        if item == "hydroxide":            lst.append(make_hydroxide())        elif item == "proton":            lst.append(smiles("[H+]"))        else:            lst.append(add_hydrogens(smiles(item)))    return Molecule(lst)def rxn_system(lst):    return ReactionSystem(lst)
+from fractions import Fraction
+import string
+import copy
+import re
+from rdkit import Chem
+from rdkit.Chem import AllChem, Draw
+from collections import defaultdict
+from collections import deque
+from collections import Counter
+import itertools
+
+
+class GraphNode:
+    def __init__(self):
+        self.nodes = {}
+        self.node_tags = {}
+        self.edges = {}
+        self.charges = {}
+        self.radicals = {}
+        self.lone_pairs = {}
+        self.attached_h = {}
+        self._next_id = 0
+
+    def add_node(self, atom, tags=None, charge=0, radical=0):
+        idx = self._next_id
+        self.nodes[idx] = atom
+        self.node_tags[idx] = set(tags) if tags else set()
+        self.edges[idx] = {}
+        self.charges[idx] = charge
+        self.radicals[idx] = radical
+        self.lone_pairs[idx] = 0
+        self.attached_h[idx] = 0
+        self._next_id += 1
+        return idx
+
+    def copy(self):
+        return copy.deepcopy(self)
+
+    def add_edge(self, i, j, bond=1, tags=None):
+        if bond not in (1, 2, 3):
+            raise ValueError("Bond must be 1, 2, or 3")
+        data = {"bond": bond, "tags": set(tags) if tags else set()}
+        self.edges[i][j] = data
+        self.edges[j][i] = data
+
+    def __hash__(self):
+        pass
+
+    def recursive_equals(self, other):
+        if not isinstance(other, GraphNode):
+            return False
+        if len(self.nodes) != len(other.nodes):
+            return False
+        self_ids = list(self.nodes.keys())
+        other_ids = list(other.nodes.keys())
+        for i in self_ids:
+            for j in other_ids:
+                if self._match_from(i, other, j, {}):
+                    return True
+        return False
+
+    def _match_from(self, i, other, j, mapping):
+        if i in mapping:
+            return mapping[i] == j
+        if j in mapping.values():
+            return False
+        if self.nodes[i] != other.nodes[j]:
+            return False
+        if self.attached_h.get(i, 0) != other.attached_h.get(j, 0):
+            return False
+        if len(self._neighbors(i)) != len(other._neighbors(j)):
+            return False
+        mapping[i] = j
+        self_neighbors = self._neighbors(i)
+        other_neighbors = other._neighbors(j)
+        for si, s_bond in self_neighbors:
+            matched = False
+            for oj, o_bond in other_neighbors:
+                if o_bond != s_bond:
+                    continue
+                new_mapping = dict(mapping)
+                if self._match_from(si, other, oj, new_mapping):
+                    mapping.update(new_mapping)
+                    matched = True
+                    break
+            if not matched:
+                return False
+        return True
+
+    def _neighbors(self, node_id):
+        result = []
+        if node_id not in self.edges:
+            return result
+        for nbr_id, data in self.edges[node_id].items():
+            result.append((nbr_id, data.get("bond", 1)))
+        return result
+
+    def __eq__(self, other):
+        return self.recursive_equals(other)
+
+    def __contains__(self, item):
+        for x in self.items:
+            if x == item:
+                return True
+        return False
+
+    def find_cycle(self):
+        visited = set()
+        parent = {}
+
+        def dfs(v, p):
+            visited.add(v)
+            parent[v] = p
+            for neighbor in self.edges[v]:
+                if neighbor == p:
+                    continue
+                if neighbor in visited:
+                    cycle = [neighbor]
+                    curr = v
+                    while curr != neighbor:
+                        cycle.append(curr)
+                        curr = parent[curr]
+                    return cycle
+                else:
+                    result = dfs(neighbor, v)
+                    if result:
+                        return result
+            return None
+
+        for node in self.nodes:
+            if node not in visited:
+                cycle = dfs(node, None)
+                if cycle:
+                    return cycle
+        return None
+
+    def remove_node(self, node_id):
+        for nbr in list(self.edges.get(node_id, {})):
+            self.edges[nbr].pop(node_id, None)
+        self.edges.pop(node_id, None)
+        self.nodes.pop(node_id, None)
+        self.node_tags.pop(node_id, None)
+        if hasattr(self, "charges"):
+            self.charges.pop(node_id, None)
+        if hasattr(self, "radicals"):
+            self.radicals.pop(node_id, None)
+        if hasattr(self, "lone_pairs"):
+            self.lone_pairs.pop(node_id, None)
+
+    def has_cycle(self):
+        return self.find_cycle() is not None
+
+    def tag_mainchain(self, atom="C", tag="mainchain"):
+        acid_carbons, aldehyde_carbons, ketone_carbons, alcohol_carbons = (
+            set(),
+            set(),
+            set(),
+            set(),
+        )
+        for o_id, sym in self.nodes.items():
+            if sym != "O":
+                continue
+            for c_id, edge in self.edges[o_id].items():
+                if self.nodes.get(c_id) != "C":
+                    continue
+                bond = edge.get("bond", 1)
+                carbon_neighbors = [
+                    n for n in self.edges[c_id] if self.nodes.get(n) == "C"
+                ]
+                if bond == 2:
+                    if len(carbon_neighbors) == 1:
+                        aldehyde_carbons.add(c_id)
+                    else:
+                        ketone_carbons.add(c_id)
+                else:
+                    alcohol_carbons.add(c_id)
+        all_numberings = enumerate_acyclic_mainchains(self, atom)
+        if not all_numberings:
+            return [], {}
+
+        def score_chain(chain):
+            length = len(chain)
+            bonds = [
+                self.edges[chain[i]][chain[i + 1]].get("bond", 1)
+                for i in range(length - 1)
+            ]
+            unsat = sum(1 for b in bonds if b > 1)
+            fg_positions = []
+            for group in (
+                acid_carbons,
+                aldehyde_carbons,
+                ketone_carbons,
+                alcohol_carbons,
+            ):
+                fg_positions.extend(i + 1 for i, c in enumerate(chain) if c in group)
+                if fg_positions:
+                    break
+            fg_positions = fg_positions or [length + 1]
+            substituent_locs = []
+            for i, c in enumerate(chain):
+                for n in self.edges[c]:
+                    if n in chain:
+                        continue
+                    sym = self.nodes.get(n)
+                    if sym in HALOGEN:
+                        substituent_locs.append(i + 1)
+                        break
+                    if sym == "C":
+                        substituent_locs.append(i + 1)
+                        break
+            sum_sub_locs = sum(substituent_locs) if substituent_locs else 0
+            return (-length, fg_positions, -unsat, sum_sub_locs)
+
+        best_chain = None
+        best_score = None
+        for chain, _ in all_numberings:
+            sc = score_chain(chain)
+            if best_score is None or sc < best_score:
+                best_score = sc
+                best_chain = chain
+        numbering = {atom_id: pos for pos, atom_id in enumerate(best_chain, 1)}
+        for atom_id in best_chain:
+            self.node_tags.setdefault(atom_id, set()).add(tag)
+        return best_chain, numbering
+
+    def __repr__(self):
+        return graphnode_to_smiles(self)
+
+    def collect_subgraph(self, start_node, exclude=None):
+        if exclude is None:
+            exclude = set()
+        seen = set()
+
+        def dfs(node):
+            if node in seen or node in exclude:
+                return
+            seen.add(node)
+            for nbr in self.edges[node]:
+                dfs(nbr)
+
+        dfs(start_node)
+        return list(seen)
+
+    def subgraph(self, node_ids):
+        sub = GraphNode()
+        sub.original_id = {}
+        m = {}
+        for i in node_ids:
+            new_id = sub.add_node(self.nodes[i], self.node_tags[i])
+            m[i] = new_id
+            sub.original_id[new_id] = i
+        for i in node_ids:
+            for j, e in self.edges[i].items():
+                if j in node_ids and m[i] < m[j]:
+                    sub.add_edge(m[i], m[j], e["bond"], e["tags"])
+        return sub
+
+    def get_substituents(self, mainchain):
+        attachments = {}
+        main_set = set(mainchain)
+        for atom in mainchain:
+            subs = []
+            for neighbor in self.edges[atom]:
+                if neighbor in main_set:
+                    continue
+                sub_nodes = self.collect_subgraph(neighbor, exclude=main_set)
+                if not sub_nodes:
+                    continue
+                subgraph = self.subgraph(sub_nodes)
+                subs.append(subgraph)
+            if subs:
+                attachments[atom] = subs
+        return attachments
+
+
+VALENCE_ELECTRONS = {
+    "C": 4,
+    "N": 5,
+    "O": 6,
+    "F": 7,
+    "Cl": 7,
+    "Br": 7,
+    "I": 7,
+    "S": 6,
+    "P": 5,
+}
+NORMAL_VALENCE = {
+    "C": 4,
+    "N": 3,
+    "O": 2,
+    "F": 1,
+    "Cl": 1,
+    "Br": 1,
+    "I": 1,
+}
+EXPANDED_VALENCE = {
+    "S": (2, 4, 6),
+    "P": (3, 5),
+}
+
+
+def calculate_electron_state(graph: GraphNode):
+    for i, atom in graph.nodes.items():
+        a = atom.upper()
+        if a not in VALENCE_ELECTRONS:
+            continue
+        v = VALENCE_ELECTRONS[a]
+        c = graph.charges.get(i, 0)
+        r = graph.radicals.get(i, 0)
+        bonding = sum(e["bond"] for e in graph.edges.get(i, {}).values())
+        if c != 0:
+            h = 0
+        elif a in NORMAL_VALENCE:
+            h = max(0, NORMAL_VALENCE[a] - bonding)
+        elif a in EXPANDED_VALENCE:
+            h = 0
+        else:
+            h = 0
+        graph.attached_h[i] = h
+        used = 2 * bonding + r + h - c
+        remaining = max(0, v - used)
+        graph.lone_pairs[i] = remaining // 2
+
+
+class TreeNode:
+    def __init__(
+        self,
+        pos,
+        chain_length,
+        nodes=None,
+        label="",
+        bonds=None,
+        is_cyclic=False,
+        atom=None,
+        exo_bond=None,
+        charge=0,
+    ):
+        self.pos = pos
+        self.chain_length = chain_length
+        self.nodes = nodes or []
+        self.label = label
+        self.bonds = bonds or [1] * (len(self.nodes) - 1)
+        self.is_cyclic = is_cyclic
+        self.children = []
+        self.atom = atom
+        self.exo_bond = exo_bond
+        self.charge = charge
+
+    def add_child(self, c):
+        self.children.append(c)
+
+    def __repr__(self, level=0):
+        ind = "  " * level
+        s = f"{ind}TreeNode(pos={self.pos}, chain_length={self.chain_length}"
+        if self.label:
+            s += f", label={self.label}"
+        if self.is_cyclic:
+            s += f", cyclic=True"
+        if self.nodes:
+            s += f", nodes={self.nodes}"
+        if self.bonds:
+            s += f", bonds={self.bonds}"
+        if self.charge != 0:
+            s += f", charge={self.charge}"
+        s += ")"
+        for c in self.children:
+            s += "\n" + c.__repr__(level + 1)
+        return s
+
+
+ALKANE = {
+    1: "meth",
+    2: "eth",
+    3: "prop",
+    4: "but",
+    5: "pent",
+    6: "hex",
+    7: "hept",
+    8: "oct",
+    9: "non",
+    10: "dec",
+}
+MULTIPLIER = {2: "di", 3: "tri", 4: "tetra", 5: "penta", 6: "hexa", 7: "hepta"}
+HALOGEN = {"F": "fluoro", "Cl": "chloro", "Br": "bromo", "I": "iodo"}
+HETERO = {"O": "oxy"}
+FUNCTIONAL_GROUP_LABELS = {
+    "carboxylic_acid",
+    "aldehyde",
+    "ketone",
+    "alcohol",
+    "cyano",
+    "nitro",
+    "halogen",
+}
+
+
+def enumerate_acyclic_mainchains(graph: GraphNode, atom="C"):
+    cycle = graph.find_cycle()
+    cycle_nodes = set(cycle) if cycle else set()
+    potential_starts = []
+    for nid, sym in graph.nodes.items():
+        if sym != atom or nid in cycle_nodes:
+            continue
+        carbon_neighbors = [
+            nbr
+            for nbr in graph.edges[nid]
+            if graph.nodes[nbr] == atom and nbr not in cycle_nodes
+        ]
+        if len(carbon_neighbors) <= 1:
+            potential_starts.append(nid)
+    raw_chains = []
+
+    def dfs(node, visited, path):
+        visited.add(node)
+        path.append(node)
+        extended = False
+        for nbr in graph.edges[node]:
+            if nbr in visited:
+                continue
+            if graph.nodes[nbr] != atom:
+                continue
+            if nbr in cycle_nodes:
+                continue
+            dfs(nbr, visited, path)
+            extended = True
+        if not extended:
+            raw_chains.append(path.copy())
+        path.pop()
+        visited.remove(node)
+
+    for start in potential_starts:
+        dfs(start, set(), [])
+    all_numberings = []
+    for chain in raw_chains:
+        numbering = {nid: pos for pos, nid in enumerate(chain, 1)}
+        all_numberings.append((chain, numbering))
+    return all_numberings
+
+
+def has_single_carbon_attachment_with_halogen_or_oxygen(
+    graph: GraphNode, cycle: list
+) -> bool:
+    cycle_set = set(cycle)
+    for c in cycle:
+        external = [n for n in graph.edges[c] if n not in cycle_set]
+        if len(external) != 1:
+            continue
+        start = external[0]
+        stack = [start]
+        visited = {c} | cycle_set
+        found_carbon = False
+        found_hetero = False
+        while stack:
+            node = stack.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            sym = graph.nodes.get(node)
+            if sym == "C":
+                found_carbon = True
+            elif sym == "O" or sym in HALOGEN:
+                found_hetero = True
+            for nbr in graph.edges[node]:
+                if nbr not in visited:
+                    stack.append(nbr)
+        if found_carbon and found_hetero:
+            return c
+    return None
+
+
+def children_only_ketone_or_halogen(node: "TreeNode") -> bool:
+    allowed = {"ketone", "halogen", "fluoro", "chloro", "bromo", "iodo", "aldehyde"}
+    for child in node.children:
+        if child.label in allowed:
+            return True
+        if children_only_ketone_or_halogen(child):
+            return True
+    return False
+
+
+def build_tree_recursive(graph: GraphNode, start_atom=None) -> TreeNode:
+    def has_carbon(g: GraphNode) -> bool:
+        return any(sym in ["c", "C"] for sym in g.nodes.values())
+
+    if not has_carbon(graph):
+        return None
+    cycle = graph.find_cycle()
+    if cycle:
+        out2 = _build_cyclic_tree(graph, cycle, start_atom)
+        convert_carbaldehyde_nodes(out2)
+        if not children_only_ketone_or_halogen(out2):
+            return out2
+        out = has_single_carbon_attachment_with_halogen_or_oxygen(graph, cycle)
+        if out:
+            return _build_acyclic_tree(graph, out)
+        return _build_cyclic_tree(graph, cycle, start_atom)
+    return _build_acyclic_tree(graph, start_atom)
+
+
+def normalize_carboxylic_acids(root: TreeNode):
+    by_pos = defaultdict(list)
+    for child in root.children:
+        by_pos[child.pos].append(child)
+    new_children = []
+    for pos, nodes in by_pos.items():
+        labels = {n.label for n in nodes}
+        if "aldehyde" in labels and "alcohol" in labels:
+            new_children.append(
+                TreeNode(
+                    pos=pos,
+                    chain_length=1,
+                    nodes=[pos],
+                    label="carboxylic_acid",
+                    bonds=[],
+                )
+            )
+        else:
+            new_children.extend(nodes)
+    root.children = sorted(new_children, key=lambda x: (x.pos, x.label))
+
+
+def _build_acyclic_tree(graph: GraphNode, start_atom=None) -> TreeNode:
+    mainchain, numbering = graph.tag_mainchain()
+    if not mainchain:
+        raise ValueError("No main chain found")
+    L = len(mainchain)
+    bonds = [
+        graph.edges[mainchain[i]][mainchain[i + 1]].get("bond", 1) for i in range(L - 1)
+    ]
+    root = TreeNode(
+        pos=0, chain_length=L, nodes=mainchain[:], label="mainchain", bonds=bonds
+    )
+    carbonyl_pairs = []
+    for c in mainchain:
+        for nbr, edge in graph.edges[c].items():
+            if graph.nodes.get(nbr) == "O" and edge.get("bond") == 2:
+                carbonyl_pairs.append((c, nbr))
+    alcohol_nodes = []
+    for c in mainchain:
+        for nbr, edge in graph.edges[c].items():
+            if graph.nodes.get(nbr) == "O" and edge.get("bond", 1) == 1:
+                alcohol_nodes.append((c, nbr))
+    halogen_nodes = []
+    for c in mainchain:
+        for nbr, edge in graph.edges[c].items():
+            if graph.nodes.get(nbr) in HALOGEN and edge.get("bond", 1) == 1:
+                halogen_nodes.append((c, nbr))
+    nitro_nodes = []
+    for c in mainchain:
+        for nbr, edge in graph.edges[c].items():
+            if graph.nodes.get(nbr) == "N":
+                oxy_count = 0
+                for n2, e2 in graph.edges[nbr].items():
+                    if (
+                        n2 != c
+                        and graph.nodes.get(n2) == "O"
+                        and e2.get("bond") in (1, 2)
+                    ):
+                        oxy_count += 1
+                if oxy_count == 2:
+                    nitro_nodes.append((c, nbr))
+    cyano_nodes = []
+    for c in mainchain:
+        for c2, edge_cc in graph.edges[c].items():
+            if graph.nodes.get(c2) != "C" or edge_cc.get("bond") != 1:
+                continue
+            for n, edge_cn in graph.edges[c2].items():
+                if graph.nodes.get(n) == "N" and edge_cn.get("bond") == 3:
+                    cyano_nodes.append((c, c2))
+                    break
+    for i, atom in enumerate(mainchain):
+        charge = graph.charges.get(atom, 0)
+        if charge != 0 and graph.nodes.get(atom) == "C":
+            root.add_child(
+                TreeNode(
+                    pos=i + 1,
+                    chain_length=1,
+                    nodes=[atom],
+                    label="charged_carbon",
+                    bonds=[],
+                    charge=charge,
+                )
+            )
+    attachments = graph.get_substituents(mainchain)
+    for atom in mainchain:
+        pos = numbering[atom]
+        for subgraph in attachments.get(atom, []):
+            if not subgraph.nodes:
+                continue
+            sub_root = build_tree_recursive(subgraph, start_atom)
+            if sub_root:
+                sub_root.pos = pos
+                root.add_child(sub_root)
+    terminal_carbons = {mainchain[0], mainchain[-1]}
+    if start_atom is not None:
+        terminal_carbons = terminal_carbons - set(graph.edges[start_atom].keys())
+    for c, _ in carbonyl_pairs:
+        label = "aldehyde" if c in terminal_carbons else "ketone"
+        root.add_child(
+            TreeNode(pos=numbering[c], chain_length=1, nodes=[c], label=label, bonds=[])
+        )
+    for c, o in alcohol_nodes:
+        root.add_child(
+            TreeNode(
+                pos=numbering[c], chain_length=1, nodes=[o], label="alcohol", bonds=[]
+            )
+        )
+    for c, x in halogen_nodes:
+        root.add_child(
+            TreeNode(
+                pos=numbering[c],
+                chain_length=1,
+                nodes=[x],
+                label="halogen",
+                atom=graph.nodes[x],
+                bonds=[],
+            )
+        )
+    for c, n in nitro_nodes:
+        root.add_child(
+            TreeNode(
+                pos=numbering[c], chain_length=1, nodes=[n], label="nitro", bonds=[]
+            )
+        )
+    for c, c2 in cyano_nodes:
+        root.add_child(
+            TreeNode(
+                pos=numbering[c], chain_length=1, nodes=[c2], label="cyano", bonds=[]
+            )
+        )
+    root.children.sort(key=lambda x: (x.pos, x.label))
+    return root
+
+
+def _build_cyclic_tree(graph: GraphNode, cycle: list, start_atom=None) -> TreeNode:
+    L = len(cycle)
+    cycle_set = set(cycle)
+    ring_bonds = [
+        graph.edges[cycle[i]][cycle[(i + 1) % L]].get("bond", 1) for i in range(L)
+    ]
+    ring_tags = [
+        graph.edges[cycle[i]][cycle[(i + 1) % L]].get("tags", set()) for i in range(L)
+    ]
+    is_aromatic = all("aromatic" in t for t in ring_tags) or (
+        ring_bonds.count(2) == 3 and ring_bonds.count(1) == 3
+    )
+    substituents_dict = {}
+    for atom in cycle:
+        for nbr in graph.edges[atom]:
+            if nbr not in cycle_set:
+                substituents_dict[atom] = True
+                break
+    ketone_pairs = []
+    alcohol_nodes = []
+    halogen_nodes = []
+    carbaldehyde_carbons = set()
+    carbaldehyde_nodes = []
+    for atom in cycle:
+        for nbr, edge in graph.edges[atom].items():
+            if nbr in cycle_set:
+                continue
+            sym = graph.nodes.get(nbr)
+            if sym == "O":
+                if edge.get("bond", 1) == 2:
+                    ketone_pairs.append((atom, nbr))
+                elif edge.get("bond", 1) == 1:
+                    alcohol_nodes.append((atom, nbr))
+            elif sym == "C":
+                bonds = graph.edges[nbr]
+                double_o = [
+                    x
+                    for x, e in bonds.items()
+                    if graph.nodes.get(x) == "O" and e.get("bond") == 2
+                ]
+                heavy_neighbors = [x for x in bonds if graph.nodes.get(x) != "H"]
+                if len(double_o) == 1 and len(heavy_neighbors) == 2 and atom in bonds:
+                    carbaldehyde_carbons.add(atom)
+                    carbaldehyde_nodes.append((atom, nbr))
+            elif sym in {"F", "Cl", "Br", "I"}:
+                halogen_nodes.append((atom, sym))
+    oriented_cycle = _orient_cycle(
+        graph,
+        cycle,
+        substituents_dict,
+        is_aromatic,
+        ketone_carbons={c for c, _ in ketone_pairs},
+        carbaldehyde_carbons=carbaldehyde_carbons,
+        start_atom=start_atom,
+    )
+    bonds = [
+        graph.edges[oriented_cycle[i]][oriented_cycle[(i + 1) % L]].get("bond", 1)
+        for i in range(L)
+    ]
+    root = TreeNode(
+        pos=0,
+        chain_length=L,
+        nodes=oriented_cycle,
+        label="cycle",
+        bonds=bonds,
+        is_cyclic=True,
+    )
+    attachments = graph.get_substituents(oriented_cycle)
+    for atom, subgraphs in attachments.items():
+        pos = oriented_cycle.index(atom) + 1
+        for subgraph in subgraphs:
+            if not subgraph.nodes:
+                continue
+            attach_atom = None
+            for n in subgraph.nodes:
+                orig_n = getattr(subgraph, "original_id", {}).get(n, n)
+                if atom in graph.edges.get(orig_n, {}):
+                    attach_atom = orig_n
+                    break
+            if attach_atom is None:
+                continue
+            bond_order = graph.edges[atom][attach_atom].get("bond", 1)
+            sub_root = build_tree_recursive(subgraph, start_atom)
+            if not sub_root:
+                continue
+            if (
+                bond_order in (2, 3)
+                and sub_root.label == "mainchain"
+                and not sub_root.children
+                and all(b == 1 for b in sub_root.bonds)
+            ):
+                root.add_child(
+                    TreeNode(
+                        pos=pos,
+                        chain_length=sub_root.chain_length,
+                        nodes=sub_root.nodes,
+                        label="exocyclic_unsat",
+                        bonds=[],
+                        exo_bond=bond_order,
+                    )
+                )
+                continue
+            sub_root.pos = pos
+            root.add_child(sub_root)
+    for c, _ in ketone_pairs:
+        root.add_child(
+            TreeNode(
+                pos=oriented_cycle.index(c) + 1,
+                chain_length=1,
+                nodes=[_],
+                label="ketone",
+                bonds=[],
+            )
+        )
+    for atom, nbr in alcohol_nodes:
+        root.add_child(
+            TreeNode(
+                pos=oriented_cycle.index(atom) + 1,
+                chain_length=1,
+                nodes=[nbr],
+                label="alcohol",
+                bonds=[],
+            )
+        )
+    for atom, sym in halogen_nodes:
+        root.add_child(
+            TreeNode(
+                pos=oriented_cycle.index(atom) + 1,
+                chain_length=1,
+                nodes=[atom],
+                label="halogen",
+                bonds=[],
+                atom=sym,
+            )
+        )
+    root.children.sort(key=lambda x: (x.pos, x.label))
+    return root
+
+
+def enumerate_cycle_numberings(cycle, start_atom=None):
+    L = len(cycle)
+    numberings = []
+    if start_atom is None:
+        starts = range(L)
+    else:
+        if start_atom not in cycle:
+            raise ValueError("start_atom not in cycle")
+        starts = [cycle.index(start_atom)]
+    for start in starts:
+        numberings.append([cycle[(start + i) % L] for i in range(L)])
+        numberings.append([cycle[(start - i) % L] for i in range(L)])
+    return numberings
+
+
+def _orient_cycle(
+    graph: GraphNode,
+    cycle: list,
+    substituents_dict: dict,
+    is_aromatic: bool = False,
+    ketone_carbons=None,
+    carbaldehyde_carbons=None,
+    start_atom=None,
+):
+    ketone_carbons = ketone_carbons or set()
+    carbaldehyde_carbons = carbaldehyde_carbons or set()
+
+    def get_cycle_bonds(oriented):
+        L = len(oriented)
+        return [
+            graph.edges[oriented[i]][oriented[(i + 1) % L]].get("bond", 1)
+            for i in range(L)
+        ]
+
+    def substituent_locants(oriented):
+        return tuple(i + 1 for i, a in enumerate(oriented) if a in substituents_dict)
+
+    def substituent_alpha_sequence(oriented):
+        seq = []
+        for i, atom in enumerate(oriented):
+            if atom in substituents_dict:
+                for nbr in graph.edges[atom]:
+                    if nbr not in oriented:
+                        sym = graph.nodes[nbr]
+                        name = HALOGEN.get(sym, sym)
+                        priority = 0 if sym in HALOGEN else 1
+                        seq.append((priority, name, i + 1))
+        seq.sort(key=lambda x: (x[0], x[1], x[2]))
+        return tuple((pos, name) for _, name, pos in seq)
+
+    best_oriented = None
+    best_score = None
+    for oriented in enumerate_cycle_numberings(cycle, start_atom):
+        score = (
+            tuple(i + 1 for i, a in enumerate(oriented) if a in carbaldehyde_carbons),
+            tuple(i + 1 for i, a in enumerate(oriented) if a in ketone_carbons),
+            substituent_locants(oriented),
+            substituent_alpha_sequence(oriented),
+        )
+        if best_score is None or score < best_score:
+            best_score = score
+            best_oriented = oriented
+    return best_oriented
+
+
+def needs_parentheses(name: str) -> bool:
+    if name == "hydroxymethyl":
+        return False
+    if "," in name:
+        return True
+    if "-" in name:
+        parts = name.split("-")
+        if any(
+            part.isdigit() or (len(part) > 1 and part[0].isdigit()) for part in parts
+        ):
+            return True
+        return False
+    return False
+
+
+VOWEL_STARTING_SUFFIXES = (
+    "ol",
+    "al",
+    "one",
+    "oic",
+    "amine",
+    "amide",
+    "thiol",
+    "hydroxy",
+)
+
+
+def elide_unsaturation_e(name: str) -> str:
+    if "benzene" in name:
+        return name
+    for suf in VOWEL_STARTING_SUFFIXES:
+        name = re.sub(
+            rf"ene(-\d+)?-{suf}", lambda m: f"en{m.group(1) or ''}-{suf}", name
+        )
+        name = re.sub(
+            rf"yne(-\d+)?-{suf}", lambda m: f"yn{m.group(1) or ''}-{suf}", name
+        )
+    return name
+
+
+def tree_to_iupac(root):
+    return elide_unsaturation_e(iupac_name(root))
+
+
+HALOGEN = {"F": "fluoro", "Cl": "chloro", "Br": "bromo", "I": "iodo"}
+MULTIPLIER = {
+    2: "di",
+    3: "tri",
+    4: "tetra",
+    5: "penta",
+    6: "hexa",
+    7: "hepta",
+    8: "octa",
+    9: "nona",
+    10: "deca",
+}
+ALKANE_STEM = {
+    1: "meth",
+    2: "eth",
+    3: "prop",
+    4: "but",
+    5: "pent",
+    6: "hex",
+    7: "hept",
+    8: "oct",
+    9: "non",
+    10: "dec",
+}
+
+
+def _build_substituent_name(child: "TreeNode", graph: "GraphNode" = None) -> str:
+    hal_count = defaultdict(list)
+    other_children = []
+    for grand in getattr(child, "children", []):
+        if grand.label == "halogen":
+            if hasattr(grand, "atom"):
+                element = grand.atom
+            elif graph is not None:
+                element = graph.nodes[grand.nodes[0]]
+            else:
+                raise ValueError(
+                    "Cannot determine halogen element. Pass `graph` or set grand.atom."
+                )
+            hal_count[element].append(grand.pos)
+        else:
+            other_children.append(grand)
+    hal_parts = []
+    for element in sorted(hal_count, key=lambda x: HALOGEN[x]):
+        positions = sorted(hal_count[element])
+        count = len(positions)
+        mult = MULTIPLIER[count] if count > 1 else ""
+        pos_str = ",".join(map(str, positions))
+        hal_parts.append(f"{pos_str}-{mult}{HALOGEN[element]}")
+    hal_prefix = "".join(hal_parts)
+    if child.label == "cycle":
+        if child.chain_length == 6 and getattr(child, "is_cyclic", False):
+            if (
+                len(child.bonds) == 6
+                and all(b in (1, 2) for b in child.bonds)
+                and child.bonds.count(2) == 3
+            ):
+                base = "phenyl"
+            else:
+                base = f"cyclo{ALKANE_STEM[child.chain_length]}yl"
+        else:
+            base = f"cyclo{ALKANE_STEM[child.chain_length]}yl"
+    elif child.chain_length == 1 and child.label == "mainchain":
+        base = "methyl"
+    else:
+        base = f"{ALKANE_STEM[child.chain_length]}yl"
+    name = hal_prefix + base if hal_prefix else base
+    if other_children:
+        inner_parts = [
+            _build_substituent_name(inner, graph) for inner in other_children
+        ]
+        name = f"({name}){''.join(inner_parts)}"
+    else:
+        if hal_prefix and child.label == "cycle":
+            name = f"({name})"
+    return name
+
+
+def iupac_name(root: "TreeNode") -> str:
+    is_cyclic = getattr(root, "is_cyclic", False)
+    is_benzene = (
+        is_cyclic
+        and root.chain_length == 6
+        and all(b in (1, 2) for b in root.bonds)
+        and root.bonds.count(2) == 3
+    )
+    double_pos = sorted(i + 1 for i, b in enumerate(root.bonds) if b == 2)
+    triple_pos = sorted(i + 1 for i, b in enumerate(root.bonds) if b == 3)
+    unsat_parts = []
+    if not is_benzene:
+        if double_pos:
+            mult = MULTIPLIER[len(double_pos)] if len(double_pos) > 1 else ""
+            unsat_parts.append(f"{','.join(map(str, double_pos))}-{mult}en")
+        if triple_pos:
+            mult = MULTIPLIER[len(triple_pos)] if len(triple_pos) > 1 else ""
+            unsat_parts.append(f"{','.join(map(str, triple_pos))}-{mult}yn")
+    unsaturation = "-".join(unsat_parts) if unsat_parts else ""
+    acid_children = [c for c in root.children if c.label == "carboxylic_acid"]
+    aldehyde_children = [c for c in root.children if c.label in ("aldehyde")]
+    carbaldehyde_children = [c for c in root.children if c.label in ("carbaldehyde")]
+    ketone_children = [c for c in root.children if c.label == "ketone"]
+    alcohol_children = [c for c in root.children if c.label == "alcohol"]
+    cyano_children = [c for c in root.children if c.label == "cyano"]
+    acid_pos = sorted(c.pos for c in acid_children)
+    aldehyde_pos = sorted(c.pos for c in aldehyde_children)
+    carbaldehyde_pos = sorted(c.pos for c in carbaldehyde_children)
+    ketone_pos = sorted(c.pos for c in ketone_children)
+    alcohol_pos = sorted(c.pos for c in alcohol_children)
+    cyano_pos = sorted(c.pos for c in cyano_children)
+    has_acid = bool(acid_pos)
+    has_higher = has_acid or bool(aldehyde_pos)
+    alcohol_is_prefix = bool(alcohol_pos) and (
+        is_benzene or has_higher or bool(ketone_pos)
+    )
+    prefix_dict = defaultdict(list)
+    if alcohol_is_prefix:
+        prefix_dict["hydroxy"].extend(alcohol_pos)
+    for child in root.children:
+        if child.label == "halogen":
+            prefix_dict[HALOGEN[child.atom]].append(child.pos)
+    for pos in cyano_pos:
+        prefix_dict["cyano"].append(pos)
+    for child in root.children:
+        if child.label == "nitro":
+            prefix_dict["nitro"].append(child.pos)
+    for child in root.children:
+        if child.label == "exocyclic_unsat":
+            bond = getattr(child, "exo_bond", 1)
+            stem = ALKANE_STEM.get(child.chain_length, "alk")
+            if bond == 2:
+                prefix_name = f"{stem}ylidene"
+            elif bond == 3:
+                prefix_name = f"{stem}ylidyne"
+            else:
+                prefix_name = f"{stem}yl"
+            prefix_dict[prefix_name].append(child.pos)
+    for child in root.children:
+        if child.label in ("mainchain", "cycle"):
+            sub_name = _build_substituent_name(child)
+            prefix_dict[sub_name].append(child.pos)
+    prefix_parts = []
+    for name in sorted(prefix_dict, key=str.lower):
+        pos_list = sorted(prefix_dict[name])
+        mult = MULTIPLIER[len(pos_list)] if len(pos_list) > 1 else ""
+        prefix_parts.append(f"{','.join(map(str, pos_list))}-{mult}{name}")
+    prefixes = "-".join(prefix_parts)
+    if is_benzene and len(prefix_parts) == 1 and prefix_parts[0].startswith("1-"):
+        prefixes = prefix_parts[0][2:]
+    core_parts = []
+    if is_benzene:
+        core_parts.append("benzene")
+    else:
+        has_suffix = bool(
+            acid_pos
+            or aldehyde_pos
+            or ketone_pos
+            or (alcohol_pos and not alcohol_is_prefix)
+        )
+        if is_cyclic:
+            cyclo_prefix = "cyclo"
+            if has_suffix or unsaturation:
+                if unsaturation:
+                    stem = f"{cyclo_prefix}{ALKANE_STEM[root.chain_length]}"
+                else:
+                    stem = f"{cyclo_prefix}{ALKANE_STEM[root.chain_length]}an"
+            else:
+                stem = f"{cyclo_prefix}{ALKANE_STEM[root.chain_length]}ane"
+            core_parts.append(stem)
+        else:
+            if has_suffix or unsaturation:
+                if unsaturation:
+                    stem = ALKANE_STEM[root.chain_length]
+                else:
+                    stem = ALKANE_STEM[root.chain_length] + "an"
+            else:
+                stem = ALKANE_STEM[root.chain_length] + "ane"
+            core_parts.append(stem)
+        if unsaturation:
+            core_parts.append(unsaturation)
+    suffix = ""
+    if has_acid:
+        if len(acid_pos) == 1:
+            suffix = "oic acid"
+        else:
+            mult = MULTIPLIER[len(acid_pos)] if len(acid_pos) > 1 else ""
+            locs = ",".join(map(str, acid_pos))
+            suffix = f"{locs}-{mult}dioic acid"
+    elif aldehyde_pos:
+        mult = MULTIPLIER[len(aldehyde_pos)] if len(aldehyde_pos) > 1 else ""
+        if len(aldehyde_pos) == 1 and aldehyde_pos[0] == 1:
+            suffix = mult + "al"
+        else:
+            locs = ",".join(map(str, aldehyde_pos))
+            suffix = f"{locs}-{mult}al"
+    elif ketone_pos:
+        mult = MULTIPLIER[len(ketone_pos)] if len(ketone_pos) > 1 else ""
+        locs = ",".join(map(str, ketone_pos))
+        suffix = f"{locs}-{mult}one"
+    elif alcohol_pos and not alcohol_is_prefix:
+        mult = MULTIPLIER[len(alcohol_pos)] if len(alcohol_pos) > 1 else ""
+        locs = ",".join(map(str, alcohol_pos))
+        suffix = f"{locs}-{mult}ol"
+    elif carbaldehyde_pos:
+        mult = MULTIPLIER[len(carbaldehyde_pos)] if len(carbaldehyde_pos) > 1 else ""
+        if len(carbaldehyde_pos) == 1 and carbaldehyde_pos[0] == 1:
+            suffix = mult + "carbaldehyde"
+        else:
+            locs = ",".join(map(str, carbaldehyde_pos))
+            suffix = f"{locs}-{mult}carbaldehyde"
+    core = "-".join(core_parts) + (f"-{suffix}" if suffix else "")
+    core = (
+        core.replace("en-al", "enal")
+        .replace("yn-al", "ynal")
+        .replace("en-one", "enone")
+        .replace("yn-one", "ynone")
+    )
+    if prefixes:
+        return f"{prefixes}-{core}"
+    return core
+
+
+def remove_unnecessary_hyphens(name: str) -> str:
+    parts = name.split("-")
+    if len(parts) == 1:
+        return name
+    out = parts[0]
+    for i in range(1, len(parts)):
+        left = parts[i - 1]
+        right = parts[i]
+        if any(c.isdigit() for c in left) or any(c.isdigit() for c in right):
+            out += "-" + right
+        else:
+            out += right
+    return out
+
+
+def convert_carbaldehyde_nodes(root: TreeNode):
+    new_children = []
+    for child in root.children:
+        convert_carbaldehyde_nodes(child)
+        if child.label == "mainchain" and child.chain_length == 1:
+            aldehyde_child = None
+            for gc in child.children:
+                if gc.label == "aldehyde":
+                    aldehyde_child = gc
+                    break
+            if aldehyde_child:
+                carbal_node = TreeNode(
+                    pos=child.pos,
+                    chain_length=1,
+                    nodes=child.nodes[:],
+                    label="carbaldehyde",
+                    bonds=[],
+                )
+                new_children.append(carbal_node)
+                continue
+        new_children.append(child)
+    root.children = new_children
+
+
+def graphnode_to_rdkit_mol(graph):
+    rw_mol = Chem.RWMol()
+    id_map = {}
+    charges = getattr(graph, "charges", {})
+    radicals = getattr(graph, "radical", {})
+    for node_id, atom_symbol in graph.nodes.items():
+        atom = Chem.Atom(atom_symbol)
+        ch = charges.get(node_id, 0)
+        if ch != 0:
+            atom.SetFormalCharge(int(ch))
+        rad = radicals.get(node_id, 0)
+        if rad:
+            atom.SetNumRadicalElectrons(int(rad))
+        atom.SetNumExplicitHs(0)
+        atom.SetNoImplicit(False)
+        idx = rw_mol.AddAtom(atom)
+        id_map[node_id] = idx
+    added = set()
+    for i, neighbors in graph.edges.items():
+        for j, data in neighbors.items():
+            if (j, i) in added:
+                continue
+            bond_order = data.get("bond", 1)
+            bond_type = {
+                1: Chem.BondType.SINGLE,
+                2: Chem.BondType.DOUBLE,
+                3: Chem.BondType.TRIPLE,
+            }.get(bond_order, Chem.BondType.SINGLE)
+            rw_mol.AddBond(id_map[i], id_map[j], bond_type)
+            added.add((i, j))
+    mol = rw_mol.GetMol()
+    try:
+        Chem.SanitizeMol(
+            mol,
+            sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL
+            ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES,
+        )
+    except Exception as e:
+        print("Warning: skipped valence sanitization:", e)
+    return mol
+
+
+def graphnode_to_smiles(graph, canonical=True):
+    mol = graphnode_to_rdkit_mol(graph)
+    return Chem.MolToSmiles(mol, canonical=canonical, allHsExplicit=False)
+
+
+def smiles_to_graphnode(smiles: str) -> GraphNode:
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES string: {smiles}")
+    Chem.Kekulize(mol, clearAromaticFlags=True)
+    graph = GraphNode()
+    idx_map = {}
+    for atom in mol.GetAtoms():
+        symbol = atom.GetSymbol()
+        charge = atom.GetFormalCharge()
+        radical = atom.GetNumRadicalElectrons()
+        node_id = graph.add_node(
+            atom=symbol, tags=set(), charge=charge, radical=radical
+        )
+        idx_map[atom.GetIdx()] = node_id
+    for bond in mol.GetBonds():
+        i = idx_map[bond.GetBeginAtomIdx()]
+        j = idx_map[bond.GetEndAtomIdx()]
+        bt = bond.GetBondType()
+        if bt == Chem.BondType.SINGLE:
+            order = 1
+        elif bt == Chem.BondType.DOUBLE:
+            order = 2
+        elif bt == Chem.BondType.TRIPLE:
+            order = 3
+        else:
+            order = 1
+        tags = set()
+        if bond.GetIsAromatic():
+            tags.add("aromatic")
+        graph.add_edge(i, j, bond=order, tags=tags)
+    calculate_electron_state(graph)
+    return graph
+
+
+def draw_graph_with_rdkit(graph, filename="compound.png", size=(600, 400)):
+    rw_mol = Chem.RWMol()
+    atom_map = {}
+    for node_id, atom_symbol in graph.nodes.items():
+        symbol = (
+            atom_symbol
+            if atom_symbol in {"Cl", "Br", "I", "F"}
+            else atom_symbol.upper()
+        )
+        atom = Chem.Atom(symbol)
+        if atom_symbol.islower() and atom_symbol not in {"c", "n", "o"}:
+            atom.SetIsAromatic(True)
+        atom_map[node_id] = rw_mol.AddAtom(atom)
+    added = set()
+    for i, nbrs in graph.edges.items():
+        for j, data in nbrs.items():
+            key = tuple(sorted((i, j)))
+            if key in added:
+                continue
+            bond_order = data.get("bond", 1)
+            if "aromatic" in data.get("tags", set()):
+                bond_type = Chem.BondType.AROMATIC
+            else:
+                bond_type = {
+                    1: Chem.BondType.SINGLE,
+                    2: Chem.BondType.DOUBLE,
+                    3: Chem.BondType.TRIPLE,
+                }.get(bond_order, Chem.BondType.SINGLE)
+            rw_mol.AddBond(atom_map[i], atom_map[j], bond_type)
+            added.add(key)
+    mol = rw_mol.GetMol()
+    try:
+        Chem.SanitizeMol(mol)
+    except Exception as e:
+        print("Sanitization failed:", e)
+    AllChem.Compute2DCoords(mol)
+    img = Draw.MolToImage(mol, size=size, kekulize=False, wedgeBonds=True)
+    img.save(filename)
+    print(f"Saved {filename}")
+
+
+def functional_group_distances(root: "TreeNode", target_label: str):
+    FUNCTIONAL_GROUP_LABELS = {
+        "carboxylic_acid",
+        "aldehyde",
+        "ketone",
+        "alcohol",
+        "cyano",
+        "nitro",
+        "chloro",
+        "fluoro",
+        "charged_carbon_1",
+        "charged_carbon_-1",
+    }
+    parent = {}
+
+    def build_parent(node):
+        for child in getattr(node, "children", []):
+            parent[child] = node
+            build_parent(child)
+
+    build_parent(root)
+    functional_nodes = []
+
+    def collect(node):
+        if helper(node) in FUNCTIONAL_GROUP_LABELS:
+            functional_nodes.append(node)
+        for c in getattr(node, "children", []):
+            collect(c)
+
+    collect(root)
+    targets = [n for n in functional_nodes if helper(n) == target_label]
+    results = []
+
+    def path_to_root(node):
+        p = []
+        while node:
+            p.append(node)
+            node = parent.get(node)
+        return p
+
+    for t in targets:
+        path_t = path_to_root(t)
+        for other in functional_nodes:
+            if other is t:
+                continue
+            path_o = path_to_root(other)
+            lca = next((n for n in path_t if n in path_o), None)
+            if lca and lca.label in ("mainchain", "cycle"):
+                dist = abs(t.pos - other.pos) + 1
+            else:
+                dist = path_t.index(lca) + path_o.index(lca)
+            results.append({"to_label": helper(other), "distance": dist})
+    return results
+
+
+def helper(x):
+    if x.label == "halogen":
+        return HALOGEN[x.atom]
+    return "charged_carbon_" + str(x.charge) if x.label == "charged_carbon" else x.label
+
+
+def group_halogens(fg_distances):
+    grouped = defaultdict(int)
+    for acid, symbol, dist in fg_distances:
+        grouped[(acid, symbol, dist)] += 1
+    result = []
+    for (acid, symbol, dist), count in grouped.items():
+        new_label = symbol
+        if count > 1:
+            new_label = f"{count}-{symbol}"
+        result.append((acid, new_label, dist))
+    return result
+
+
+def build_tree(graph):
+    tmp = build_tree_recursive(graph)
+    normalize_carboxylic_acids(tmp)
+    convert_carbaldehyde_nodes(tmp)
+    return tmp
+
+
+def all_atoms_neutral(graph):
+    if not hasattr(graph, "charges"):
+        return True
+    return all(charge == 0 for charge in graph.charges.values())
+
+
+def count_pi_bonds(graph):
+    counted = set()
+    pi_count = 0
+    for i, neighbors in graph.edges.items():
+        for j, data in neighbors.items():
+            if (j, i) in counted:
+                continue
+            bond_order = data.get("bond", 1)
+            if bond_order == 2:
+                pi_count += 1
+            elif bond_order == 3:
+                pi_count += 2
+            counted.add((i, j))
+    return pi_count
+
+
+def get_charged_atoms(graph):
+    charged_atoms = []
+    for atom_id, atom_symbol in graph.nodes.items():
+        ch = graph.charges.get(atom_id, 0)
+        if ch != 0:
+            charged_atoms.append((atom_symbol, ch))
+    return charged_atoms
+
+
+def find_internal_charge_pairs(graph: "GraphNode"):
+    pairs = []
+    seen = set()
+    charges = getattr(graph, "charges", {})
+    lone_pairs = getattr(graph, "lone_pairs", {})
+    positives = []
+    negatives = []
+    lp_atoms = []
+    for atom_id, sym in graph.nodes.items():
+        ch = charges.get(atom_id, 0)
+        lp = lone_pairs.get(atom_id, 0)
+        if ch > 0:
+            positives.append((atom_id, sym, ch))
+        elif ch < 0:
+            negatives.append((atom_id, sym, ch))
+        if lp > 0 and sym.upper() != "C":
+            lp_atoms.append((atom_id, sym, lp))
+
+    def bfs_distance(start, goal):
+        visited = set()
+        queue = deque([(start, 0)])
+        while queue:
+            node, dist = queue.popleft()
+            if node == goal:
+                return dist
+            if node in visited:
+                continue
+            visited.add(node)
+            for nbr in graph.edges.get(node, {}):
+                if nbr not in visited:
+                    queue.append((nbr, dist + 1))
+        return float("inf")
+
+    def add_pairs(list1, list2, label):
+        for a_id, a_sym, a_val in list1:
+            for b_id, b_sym, b_val in list2:
+                if a_id == b_id:
+                    continue
+                key = tuple(sorted((a_id, b_id))) + (label,)
+                if key in seen:
+                    continue
+                seen.add(key)
+                dist = bfs_distance(a_id, b_id)
+                pairs.append((dist, a_sym, b_sym, a_val, b_val, label))
+
+    add_pairs(positives, negatives, "positive_negative")
+    add_pairs(positives, lp_atoms, "positive_lone_pair")
+    add_pairs(positives, positives, "positive_positive")
+    add_pairs(negatives, negatives, "negative_negative")
+    add_pairs(negatives, lp_atoms, "negative_lone_pair")
+    add_pairs(lp_atoms, lp_atoms, "lone_pair_lone_pair")
+    pairs.sort(key=lambda x: x[0])
+    return pairs
+
+
+def condense_functional_groups(
+    graph: "GraphNode", allow=[True, True, True, True, True]
+) -> "GraphNode":
+    def condense_oh(g):
+        for o_id, sym in list(g.nodes.items()):
+            if sym != "O":
+                continue
+            neighbors = list(g.edges.get(o_id, {}).items())
+            if len(neighbors) != 1:
+                continue
+            ext, data = neighbors[0]
+            if data.get("bond", 1) != 1:
+                continue
+            if g.charges.get(o_id, 0) != 0:
+                continue
+            new = g.add_node("OH", tags={"condensed"})
+            g.charges[new] = 0
+            g.lone_pairs[new] = 0
+            g.radicals[new] = 0
+            g.add_edge(new, ext, bond=1)
+            g.remove_node(o_id)
+
+    def condense_cooh(g):
+        for c_id, sym in list(g.nodes.items()):
+            if sym != "C":
+                continue
+            o_double = None
+            o_single = None
+            external = None
+            for nbr, e in g.edges.get(c_id, {}).items():
+                bond = e.get("bond", 1)
+                if g.nodes[nbr] == "O" and bond == 2:
+                    o_double = nbr
+                elif g.nodes[nbr] == "O" and bond == 1:
+                    o_single = nbr
+                else:
+                    external = nbr
+            if not (o_double and o_single and external):
+                continue
+            if g.charges.get(o_single, 0) != 0:
+                continue
+            new = g.add_node("COOH", tags={"condensed"})
+            g.charges[new] = 0
+            g.lone_pairs[new] = 0
+            g.radicals[new] = 0
+            g.add_edge(new, external, bond=g.edges[c_id][external]["bond"])
+            for x in (c_id, o_double, o_single):
+                g.remove_node(x)
+
+    def find_nitro_groups(g):
+        out = []
+        for n_id, sym in g.nodes.items():
+            if sym != "N":
+                continue
+            o_ids = []
+            orders = []
+            for nbr, e in g.edges[n_id].items():
+                if g.nodes[nbr] == "O":
+                    o_ids.append(nbr)
+                    orders.append(e.get("bond", 1))
+            if len(o_ids) == 2 and sorted(orders) == [1, 2]:
+                out.append((n_id, o_ids))
+        return out
+
+    def condense_no2(g):
+        for n_id, o_ids in find_nitro_groups(g):
+            external = None
+            for nbr in g.edges[n_id]:
+                if nbr not in o_ids:
+                    external = nbr
+                    break
+            new = g.add_node("NO2", tags={"condensed"})
+            g.charges[new] = 0
+            g.lone_pairs[new] = 0
+            g.radicals[new] = 0
+            if external is not None:
+                bond = g.edges[n_id][external]["bond"]
+                g.add_edge(new, external, bond=bond)
+            for x in o_ids + [n_id]:
+                g.remove_node(x)
+
+    def condense_ccl3(g):
+        for c_id, sym in list(g.nodes.items()):
+            if sym != "C":
+                continue
+            cl = []
+            external = None
+            for nbr, e in g.edges.get(c_id, {}).items():
+                if g.nodes[nbr] == "Cl" and e.get("bond", 1) == 1:
+                    cl.append(nbr)
+                else:
+                    external = nbr
+            if len(cl) != 3:
+                continue
+            new = g.add_node("CCl3", tags={"condensed"})
+            g.charges[new] = 0
+            g.lone_pairs[new] = 0
+            g.radicals[new] = 0
+            if external is not None:
+                bond = g.edges[c_id][external]["bond"]
+                g.add_edge(new, external, bond=bond)
+            for x in cl + [c_id]:
+                g.remove_node(x)
+
+    def condense_och3(g):
+        for o_id, sym in list(g.nodes.items()):
+            if sym != "O":
+                continue
+            neighbors = list(g.edges.get(o_id, {}).items())
+            if len(neighbors) != 2:
+                continue
+            main_ext = None
+            methyl_c = None
+            for nbr, data in neighbors:
+                if g.nodes[nbr] == "C" and len(g.edges.get(nbr, {})) == 1:
+                    methyl_c = nbr
+                else:
+                    main_ext = nbr
+            if not (main_ext and methyl_c):
+                continue
+            new = g.add_node("OCH3", tags={"condensed"})
+            g.charges[new] = 0
+            g.lone_pairs[new] = 0
+            g.radicals[new] = 0
+            g.add_edge(new, main_ext, bond=g.edges[o_id][main_ext]["bond"])
+            g.remove_node(o_id)
+            g.remove_node(methyl_c)
+
+    g = graph.copy()
+    changed = True
+    while changed:
+        before = len(g.nodes)
+        if allow[0]:
+            condense_cooh(g)
+        if allow[1]:
+            condense_no2(g)
+        if allow[2]:
+            condense_ccl3(g)
+        if allow[3]:
+            condense_oh(g)
+        if len(allow) > 4 and allow[4]:
+            condense_och3(g)
+        changed = len(g.nodes) != before
+    return g
+
+
+def distances_from_acidic_groups(graph: "GraphNode"):
+    results = []
+    sources = [(aid, sym) for aid, sym in graph.nodes.items() if sym in {"COOH", "OH"}]
+    if not sources:
+        return []
+    halogens = {"F", "Cl", "Br", "I"}
+    targets = []
+    for aid, sym in graph.nodes.items():
+        if sym in halogens:
+            targets.append((aid, sym))
+        elif "condensed" in graph.node_tags.get(aid, set()):
+            targets.append((aid, sym))
+    target_ids = {aid for aid, _ in targets}
+
+    def bfs_all_distances(start):
+        dist = {start: 0}
+        q = deque([start])
+        while q:
+            u = q.popleft()
+            for v in graph.edges.get(u, {}):
+                if v not in dist:
+                    dist[v] = dist[u] + 1
+                    q.append(v)
+        return dist
+
+    for src_id, src_sym in sources:
+        dist_map = bfs_all_distances(src_id)
+        for tgt_id, tgt_sym in targets:
+            if tgt_id == src_id:
+                continue
+            if tgt_id in dist_map:
+                results.append((src_sym, tgt_sym, dist_map[tgt_id]))
+    results.sort(key=lambda x: (x[0], x[2]))
+    return results
+
+
+def print_graphnode(graph: "GraphNode"):
+    print("=== GraphNode ===")
+    print("Nodes:")
+    for node_id, sym in graph.nodes.items():
+        ch = getattr(graph, "charges", {}).get(node_id, 0)
+        rad = getattr(graph, "radicals", {}).get(node_id, 0)
+        lp = getattr(graph, "lone_pairs", {}).get(node_id, 0)
+        tags = graph.node_tags.get(node_id, set())
+        print(
+            f"  {node_id}: {sym}, charge={ch}, radical={rad}, lone_pairs={lp}, tags={tags}"
+        )
+    print("\nEdges:")
+    for i, nbrs in graph.edges.items():
+        for j, data in nbrs.items():
+            bond = data.get("bond", 1)
+            tags = data.get("tags", set())
+            print(f"  {i} - {j}, bond={bond}, tags={tags}")
+    print("================\n")
+
+
+def identify_ortho_meta_para_graph(graph: "GraphNode"):
+    ring = None
+    for n in graph.nodes:
+        if graph.nodes[n] != "C":
+            continue
+        neighbors = [nbr for nbr in graph.edges[n] if graph.nodes[nbr] == "C"]
+        if len(neighbors) != 2:
+            continue
+        visited = [n]
+        current = neighbors[0]
+        prev = n
+        while len(visited) < 6:
+            visited.append(current)
+            next_c = [
+                nbr
+                for nbr in graph.edges[current]
+                if graph.nodes[nbr] == "C" and nbr != prev
+            ]
+            if not next_c:
+                break
+            prev, current = current, next_c[0]
+        if len(visited) == 6 and all(graph.nodes[x] == "C" for x in visited):
+            ring = visited
+            break
+    if not ring:
+        return None
+    ring_set = set(ring)
+    ring_len = 6
+    ref_atom = None
+    for sub_id, sym in graph.nodes.items():
+        if sym not in {"OH", "COOH"}:
+            continue
+        for nbr in graph.edges[sub_id]:
+            if nbr in ring_set:
+                ref_atom = nbr
+                break
+        if ref_atom is not None:
+            break
+    if ref_atom is None:
+        return []
+    distances = {ref_atom: 0}
+    queue = deque([ref_atom])
+    while queue:
+        u = queue.popleft()
+        for v in graph.edges[u]:
+            if v in ring_set and v not in distances:
+                distances[v] = distances[u] + 1
+                queue.append(v)
+    results = []
+    for ring_atom in ring:
+        if ring_atom == ref_atom:
+            continue
+        for nbr in graph.edges[ring_atom]:
+            if nbr in ring_set:
+                continue
+            sym = graph.nodes[nbr]
+            if sym in {"Cl", "Br", "F", "I"} or "condensed" in graph.node_tags.get(
+                nbr, set()
+            ):
+                d = distances.get(ring_atom)
+                if d is None:
+                    continue
+                d = min(d, ring_len - d)
+                if d == 1:
+                    rel = "ortho"
+                elif d == 2:
+                    rel = "meta"
+                elif d == 3:
+                    rel = "para"
+                else:
+                    continue
+                results.append((rel, sym))
+    return results
+
+
+def condense_ch3(graph: "GraphNode") -> "GraphNode":
+    g = graph.copy()
+    for c_id, sym in list(g.nodes.items()):
+        if sym != "C":
+            continue
+        neighbors = list(g.edges.get(c_id, {}).items())
+        if len(neighbors) != 1:
+            continue
+        ext, data = neighbors[0]
+        if data.get("bond", 1) != 1:
+            continue
+        if g.nodes[ext] in {"O", "N", "S"}:
+            continue
+        new_id = g.add_node("CH3", tags={"condensed"})
+        g.charges[new_id] = 0
+        g.radicals[new_id] = 0
+        g.lone_pairs[new_id] = 0
+        g.add_edge(new_id, ext, bond=1)
+        g.remove_node(c_id)
+    return g
+
+
+def inductive_effect_acid(fg_dist_a, fg_dist_b):
+    INDUCTIVE_STRENGTH = {
+        "NO2": 5,
+        "CN": 4,
+        "F": 3,
+        "Cl": 2,
+        "Br": 1.5,
+        "I": 1,
+        "2-Cl": 3.25,
+        "3-Cl": 3.5,
+        "CCl3": 3.5,
+    }
+    sgn = 1
+    if (
+        len(fg_dist_a) + len(fg_dist_b) not in [1, 2]
+        or abs(len(fg_dist_a) - len(fg_dist_b)) > 1
+    ):
+        return 0
+    if len(fg_dist_a) == len(fg_dist_b):
+        if fg_dist_a[0][2] == fg_dist_b[0][2]:
+            if fg_dist_a[0][1] == fg_dist_b[0][1]:
+                return 0
+            if INDUCTIVE_STRENGTH.get(fg_dist_a[0][1], 1) > INDUCTIVE_STRENGTH.get(
+                fg_dist_b[0][1], 1
+            ):
+                return 1
+            return -1
+        elif fg_dist_a[0][1] == fg_dist_b[0][1]:
+            sgn2 = 1 if INDUCTIVE_STRENGTH.get(fg_dist_a[0][1], 1) > 0 else -1
+            if fg_dist_a[0][2] > fg_dist_b[0][2]:
+                return sgn2
+            return -sgn2
+        else:
+            return 0
+    elif len(fg_dist_a) == 1:
+        if INDUCTIVE_STRENGTH.get(fg_dist_a[0][1], 1) > 0:
+            return 1
+        return -1
+    elif len(fg_dist_b) == 1:
+        if INDUCTIVE_STRENGTH.get(fg_dist_b[0][1], 1) > 0:
+            return -1
+        return 1
+    return 0
+
+
+def compare_acidic_strength(graph_a: "GraphNode", graph_b: "GraphNode") -> int:
+    con_a = condense_functional_groups(graph_a)
+    con_b = condense_functional_groups(graph_b)
+    orig_a = con_a.copy()
+    orig_b = con_b.copy()
+    con_a = condense_ch3(con_a)
+    con_b = condense_ch3(con_b)
+    fg_dist_a = group_halogens(distances_from_acidic_groups(con_a))
+    fg_dist_b = group_halogens(distances_from_acidic_groups(con_b))
+    cy_a = identify_ortho_meta_para_graph(con_a)
+    cy_b = identify_ortho_meta_para_graph(con_b)
+    if cy_a is not None and cy_b is not None:
+        cy = Counter(cy_a) & Counter(cy_b)
+        cy_a = list(Counter(cy_a) - cy)
+        cy_b = list(Counter(cy_b) - cy)
+        if (
+            len(cy_a) == 1
+            and len(cy_b) == 1
+            and cy_a[0][0] == cy_b[0][0]
+            and cy_a[0][0] != "meta"
+            and cy_a[0][1] in ["F", "Cl", "Br", "I"]
+            and cy_b[0][1] in ["F", "Cl", "Br", "I"]
+        ):
+            return -inductive_effect_acid(fg_dist_a, fg_dist_b)
+        if len(cy_a) == 1 and len(cy_b) == 1 and cy_a[0][1] == cy_b[0][1]:
+            if cy_a[0][1] == "OCH3":
+                score = {"meta": 3, "ortho": 2, "para": 1}
+                s_a = score[cy_a[0][0]]
+                s_b = score[cy_b[0][0]]
+                if s_a > s_b:
+                    return 1
+                if s_a < s_b:
+                    return -1
+            if cy_a[0][0] == "ortho":
+                return 1
+            if cy_b[0][0] == "ortho":
+                return -1
+        lst = []
+        for item in [cy_a, cy_b]:
+            other = (None, None)
+            for item2 in item:
+                if item2[0] != "meta":
+                    if item2[1] == "NO2":
+                        other = ("-M", "-I")
+                    elif item2[1] == "CCl3":
+                        other = ("-I", "-M")
+                    elif item2[1] == "CH3":
+                        other = ("+H", "+I")
+                    elif item2[1] == "OCH3":
+                        other = ("+M", "-I")
+                    elif item2[1] in ["Cl", "F", "Br", "I"]:
+                        other = ("-I", "+M")
+                else:
+                    if item2[1] == "NO2":
+                        other = ("-I", None)
+                    elif item2[1] == "CCl3":
+                        other = ("-I", None)
+                    elif item2[1] == "CH3":
+                        other = ("+H", "+I")
+                    elif item2[1] == "OCH3":
+                        other = ("-I", None)
+                    elif item2[1] in ["Cl", "F", "Br", "I"]:
+                        other = ("-I", None)
+            lst.append(other)
+        effect_a = lst[0]
+        effect_b = lst[1]
+
+        def score(x):
+            if x is None:
+                return 0
+            sgn = -1
+            if x[0] == "-":
+                sgn = 1
+            return sgn * "k I H M".split(" ").index(x[1])
+
+        for i in range(2):
+            if score(effect_a[i]) > score(effect_b[i]):
+                return 1
+            elif score(effect_a[i]) < score(effect_b[i]):
+                return -1
+            if effect_a[i] in ["+I", "-I"]:
+                return inductive_effect_acid(fg_dist_a, fg_dist_b)
+            if (
+                i == 0
+                and effect_a[i] == "-M"
+                and len(cy_a) == 1
+                and len(cy_b) == 1
+                and cy_a[0][1] == "NO2"
+                and cy_b[0][1] == "NO2"
+            ):
+                if cy_a[0][0] == "para":
+                    return 1
+                if cy_b[0][0] == "para":
+                    return -1
+    fg_dist_a = group_halogens(distances_from_acidic_groups(orig_a))
+    fg_dist_b = group_halogens(distances_from_acidic_groups(orig_b))
+    return inductive_effect_acid(fg_dist_a, fg_dist_b)
+
+
+def compare_stability(graph_a: "GraphNode", graph_b: "GraphNode") -> int:
+    if all_atoms_neutral(graph_a) and not all_atoms_neutral(graph_b):
+        return 1
+    if not all_atoms_neutral(graph_a) and all_atoms_neutral(graph_b):
+        return -1
+    if count_pi_bonds(graph_a) > count_pi_bonds(graph_b):
+        return 1
+    if count_pi_bonds(graph_a) < count_pi_bonds(graph_b):
+        return -1
+    ca = set(get_charged_atoms(graph_a))
+    cb = set(get_charged_atoms(graph_b))
+    c = ca & cb
+    ca = list(ca - c)
+    cb = list(cb - c)
+    stability_score = {"C": 1, "N": 2, "O": 3, "S": 4}
+
+    def c_score(ca, cb, index_a, index_b):
+        if ca[index_a][1] == cb[index_b][1] and ca[index_a][0] != cb[index_b][0]:
+            if ca[index_a][1] == 0:
+                return 0
+            sgn = -1 if ca[index_a][1] < 0 else 1
+            if stability_score[ca[index_a][0]] > stability_score[cb[index_b][0]]:
+                return -sgn
+            if stability_score[ca[index_a][0]] < stability_score[cb[index_b][0]]:
+                return sgn
+        return 0
+
+    if len(ca) == len(cb):
+        if len(ca) == 2:
+            for item in [((1, 1), (2, 2)), ((1, 2), (2, 1))]:
+                tmp = set(
+                    [c_score(ca, cb, item2[0] - 1, item2[1] - 1) for item2 in item]
+                )
+                if 0 not in tmp and len(tmp) == 1:
+                    return list(tmp)[0]
+        elif len(ca) == 1:
+            tmp = c_score(ca, cb, 0, 0)
+            if tmp != 0:
+                return tmp
+    for item in [
+        "positive_negative",
+        "positive_lone_pair",
+        "positive_positive",
+        "negative_negative",
+        "negative_lone_pair",
+        "lone_pair_lone_pair",
+    ]:
+        sa = find_internal_charge_pairs(graph_a)
+        sb = find_internal_charge_pairs(graph_b)
+        sa, sb = [
+            set([item3 for item3 in item2 if item3[-1] == item]) for item2 in [sa, sb]
+        ]
+        s = sa & sb
+        sa = list(sa - s)
+        sb = list(sb - s)
+        if (
+            len(sa) == 1
+            and len(sb) == 1
+            and all(sa[0][i] == sb[0][i] for i in range(1, len(sa[0])))
+        ):
+            sgn = 1
+            if item in ["positive_negative", "positive_lone_pair"]:
+                sgn = -1
+            if sa[0][0] < sb[0][0]:
+                return sgn
+            if sa[0][0] > sb[0][0]:
+                return -sgn
+    ha = count_hyperconjugation(graph_a)
+    hb = count_hyperconjugation(graph_b)
+    if ha > hb:
+        return 1
+    elif ha < hb:
+        return -1
+    tree_a = build_tree(graph_a)
+    tree_b = build_tree(graph_b)
+    acid_labels = {"charged_carbon"}
+    acids_a = [c for c in tree_a.children if c.label in acid_labels]
+    acids_b = [c for c in tree_b.children if c.label in acid_labels]
+    if not acids_a or not acids_b:
+        return 0
+    type_a = helper(acids_a[0])
+    type_b = helper(acids_b[0])
+    if type_a != type_b:
+        return 0
+    fg_dist_a = group_halogens(functional_group_distances(tree_a, target_label=type_a))
+    fg_dist_b = group_halogens(functional_group_distances(tree_b, target_label=type_b))
+    INDUCTIVE_STRENGTH = {
+        "nitro": 5,
+        "cyano": 4,
+        "fluoro": 3,
+        "chloro": 2,
+        "bromo": 1.5,
+        "iodo": 1,
+        "dichloro": 3.25,
+    }
+    sgn = 1
+    if type_a == "charged_carbon_-1":
+        sgn = -1
+    if (
+        len(fg_dist_a) + len(fg_dist_b) not in [1, 2]
+        or abs(len(fg_dist_a) - len(fg_dist_b)) > 1
+    ):
+        return 0
+    if len(fg_dist_a) == len(fg_dist_b):
+        if fg_dist_a[0]["distance"] == fg_dist_b[0]["distance"]:
+            if fg_dist_a[0]["to_label"] == fg_dist_b[0]["to_label"]:
+                return 0
+            if INDUCTIVE_STRENGTH.get(
+                fg_dist_a[0]["to_label"], 1
+            ) > INDUCTIVE_STRENGTH.get(fg_dist_b[0]["to_label"], 1):
+                return -sgn
+            return sgn
+        elif fg_dist_a[0]["to_label"] == fg_dist_b[0]["to_label"]:
+            sgn2 = 1 if INDUCTIVE_STRENGTH.get(fg_dist_a[0]["to_label"], 1) > 0 else -1
+            if fg_dist_a[0]["distance"] > fg_dist_b[0]["distance"]:
+                return sgn * sgn2
+            return -sgn * sgn2
+        else:
+            return 0
+
+
+def is_carbon(graph, n):
+    return graph.nodes[n].upper() == "C"
+
+
+def is_acceptor_center(graph, n):
+    if graph.charges.get(n, 0) > 0:
+        return True
+    if graph.radicals.get(n, 0) > 0:
+        return True
+    for nbr, data in graph.edges[n].items():
+        if data.get("bond", 1) >= 2:
+            return True
+    return False
+
+
+def count_hyperconjugation(graph, include_CC=False):
+    count = 0
+    for acc in graph.nodes:
+        if not is_carbon(graph, acc):
+            continue
+        if not is_acceptor_center(graph, acc):
+            continue
+        for beta, data in graph.edges[acc].items():
+            if not is_carbon(graph, beta):
+                continue
+            h_count = graph.attached_h.get(beta, 0)
+            count += h_count
+            if include_CC:
+                for nbr2, data2 in graph.edges[beta].items():
+                    if nbr2 == acc:
+                        continue
+                    if is_carbon(graph, nbr2) and data2.get("bond", 1) == 1:
+                        count += 1
+    return count
+
+
+def custom_sort(items, cmp):
+    labels = {obj: string.ascii_lowercase[i] for i, obj in enumerate(items)}
+    score = {obj: 0 for obj in items}
+    for a in items:
+        for b in items:
+            if a is b:
+                continue
+            c = cmp(a, b)
+            if c == 1:
+                score[a] += 1
+                score[b] -= 1
+            elif c == -1:
+                score[a] -= 1
+                score[b] += 1
+    buckets = {}
+    for obj, s in score.items():
+        buckets.setdefault(s, []).append(labels[obj])
+    return [buckets[s] for s in sorted(buckets, reverse=True)]
+
+
+def iupac(graph, debug=False):
+    tmp = build_tree(graph)
+    if debug:
+        print(tmp)
+    return remove_unnecessary_hyphens(tree_to_iupac(tmp))
+
+
+def smiles(string):
+    return smiles_to_graphnode(string)
+
+
+def draw(graph, filename="compound.png", size=(300, 200)):
+    draw_graph_with_rdkit(graph, filename, size)
+
+
+def format_formula(counts, style="inorganic"):
+    def fmt(atom):
+        n = counts.get(atom, 0)
+        if n <= 0:
+            return None
+        return atom if n == 1 else f"{atom}{n}"
+
+    if style == "inorganic" and "C" not in counts:
+        parts = []
+        center_atom = None
+        for center in ("S", "P", "N", "C"):
+            if counts.get(center, 0) > 0:
+                center_atom = center
+                parts.append(fmt(center))
+                break
+        if center_atom is None:
+            for atom in sorted(counts):
+                f = fmt(atom)
+                if f:
+                    parts.append(f)
+            out = "".join(parts)
+            if out == "HO":
+                return "OH"
+            return out
+        for atom in sorted(a for a in counts if a != center_atom):
+            f = fmt(atom)
+            if f:
+                parts.append(f)
+        return "".join(parts)
+    parts = []
+    if counts.get("C", 0) > 0:
+        for atom in ("C", "H"):
+            f = fmt(atom)
+            if f:
+                parts.append(f)
+        for atom in sorted(a for a in counts if a not in ("C", "H")):
+            f = fmt(atom)
+            if f:
+                parts.append(f)
+    else:
+        for atom in sorted(counts):
+            f = fmt(atom)
+            if f:
+                parts.append(f)
+    return "".join(parts)
+
+
+def molecular_formula(graphnodes):
+    counts = []
+    for node in graphnodes:
+        for atom in node.nodes.values():
+            counts.append(atom)
+    return dict(Counter(counts))
+
+
+def total_charge(node: GraphNode) -> int:
+    return sum(node.charges.values())
+
+
+def molecular_equation(graphnodes):
+    counts = []
+    for node in graphnodes:
+        s = []
+        for atom in node.nodes.values():
+            s.append(atom)
+        counts.append(dict(Counter(s)))
+    a, b = None, 1
+    if len(graphnodes) == 2:
+        a, b = total_charge(graphnodes[0]), total_charge(graphnodes[1])
+        a, b = abs(a), abs(b)
+        a, b = round(a / gcd(a, b)), round(b / gcd(a, b))
+    out = []
+    for i in range(len(graphnodes)):
+        n = [b, a][i]
+        c = format_formula(counts[i])
+        if n > 1 and len([item for item in c if item.isupper()]) > 1:
+            c = f"({c}){n}"
+        elif n > 1:
+            c = f"{c}{n}"
+        out.append(c)
+    return "".join(out)
+
+
+class Molecule:
+    def __init__(self, ions):
+        self.ions = ions
+        self.sort_ion()
+
+    def __repr__(self):
+        return molecular_formula(self.ions)
+
+    def add_node(self, node):
+        self.ions.append(node)
+
+    def remove_node(self, node):
+        self.ions.remove(node)
+
+    def nodes(self):
+        return self.ions
+
+    def sort_ion(self):
+        if len(self.ions) == 2:
+            self.molecules = list(sorted(self.ions, key=total_charge))[::-1]
+
+    def net_charge(self) -> int:
+        return sum(node.charge for node in self.ions)
+
+    def charged_nodes(self):
+        return [n for n in self.ions if n.charge != 0]
+
+    def neutral_nodes(self):
+        return [n for n in self.ions if n.charge == 0]
+
+    def is_ionic(self) -> bool:
+        return any(n.charge != 0 for n in self.ions)
+
+    def __eq__(self, other):
+        for item in itertools.permutations(self.ions):
+            if all(item2[0] == item2[1] for item2 in zip(other.ions, item)):
+                return True
+        return False
+
+    def __contains__(self, item):
+        for x in self.items:
+            if x == item:
+                return True
+        return False
+
+    def merge_nodes(self, node_a, node_b):
+        if node_a not in self.ions or node_b not in self.ions:
+            raise ValueError("Node not part of molecule")
+        node_a.atoms.extend(node_b.atoms)
+        node_a.bonds.extend(node_b.bonds)
+        node_a.charge += node_b.charge
+        self.remove_node(node_b)
+
+    def full_struct(self):
+        if len(self.ions) == 1:
+            return str(self.ions[0])
+        return "".join(["{" + str(item) + "}" for item in self.ions])
+
+    def __repr__(self):
+        return f"{molecular_equation(self.ions)}"
+
+
+def add_hydrogens(node):
+    if not hasattr(node, "attached_h"):
+        return node
+    for atom_index, h_count in list(node.attached_h.items()):
+        for _ in range(h_count):
+            h_index = node.add_node("H")
+            node.add_edge(atom_index, h_index, 1)
+        node.attached_h[atom_index] = 0
+    return node
+
+
+def remove_explicit_hydrogens(node):
+    if not hasattr(node, "attached_h"):
+        node.attached_h = {}
+    hydrogen_indices = [i for i, a in enumerate(node.atoms) if a == "H"]
+    if not hydrogen_indices:
+        return node
+    hydrogen_set = set(hydrogen_indices)
+    new_atoms = []
+    index_map = {}
+    for old_idx, atom in enumerate(node.atoms):
+        if old_idx not in hydrogen_set:
+            index_map[old_idx] = len(new_atoms)
+            new_atoms.append(atom)
+    for i, j, order in node.bonds:
+        if i in hydrogen_set and j not in hydrogen_set:
+            node.attached_h[j] = node.attached_h.get(j, 0) + 1
+        elif j in hydrogen_set and i not in hydrogen_set:
+            node.attached_h[i] = node.attached_h.get(i, 0) + 1
+    new_bonds = []
+    for i, j, order in node.bonds:
+        if i in hydrogen_set or j in hydrogen_set:
+            continue
+        new_bonds.append((index_map[i], index_map[j], order))
+    node.atoms = new_atoms
+    node.bonds = new_bonds
+    return node
+
+
+def hydrogen_molecule() -> GraphNode:
+    graph = GraphNode()
+    h1 = graph.add_node(atom="H", tags=set(), charge=0, radical=0)
+    h2 = graph.add_node(atom="H", tags=set(), charge=0, radical=0)
+    graph.add_edge(h1, h2, bond=1, tags=set())
+    calculate_electron_state(graph)
+    return Molecule([graph])
+
+
+def collect_elements(dicts):
+    elements = set()
+    for d in dicts:
+        elements |= set(d.keys())
+    return sorted(elements)
+
+
+def build_matrix(reactants, products):
+    all_dicts = reactants + products
+    elements = collect_elements(all_dicts)
+    matrix = []
+    for elem in elements:
+        row = []
+        for d in reactants:
+            row.append(d.get(elem, 0))
+        for d in products:
+            row.append(-d.get(elem, 0))
+        matrix.append(row)
+    return matrix
+
+
+def rref(matrix):
+    M = [[Fraction(x) for x in row] for row in matrix]
+    rows = len(M)
+    cols = len(M[0])
+    r = 0
+    for c in range(cols):
+        if r >= rows:
+            break
+        pivot = None
+        for i in range(r, rows):
+            if M[i][c] != 0:
+                pivot = i
+                break
+        if pivot is None:
+            continue
+        M[r], M[pivot] = M[pivot], M[r]
+        pivot_val = M[r][c]
+        M[r] = [x / pivot_val for x in M[r]]
+        for i in range(rows):
+            if i != r and M[i][c] != 0:
+                factor = M[i][c]
+                M[i] = [M[i][j] - factor * M[r][j] for j in range(cols)]
+        r += 1
+    return M
+
+
+def extract_coeffs(rref_matrix):
+    cols = len(rref_matrix[0])
+    solution = [Fraction(0)] * cols
+    solution[-1] = 1
+    for row in reversed(rref_matrix):
+        leading = None
+        for i, val in enumerate(row):
+            if val == 1:
+                leading = i
+                break
+        if leading is None or leading == cols - 1:
+            continue
+        solution[leading] = -sum(row[j] * solution[j] for j in range(leading + 1, cols))
+    lcm = 1
+    for x in solution:
+        lcm = lcm * x.denominator // gcd(lcm, x.denominator)
+    return [int(x * lcm) for x in solution]
+
+
+def gcd(a, b):
+    while b:
+        a, b = b, a % b
+    return a
+
+
+def balance(reactant_dicts, product_dicts):
+    M = build_matrix(reactant_dicts, product_dicts)
+    R = rref(M)
+    coeffs = extract_coeffs(R)
+    return coeffs
+
+
+def make_hydroxide():
+    g = GraphNode()
+    o = g.add_node("O")
+    h = g.add_node("H")
+    g.add_edge(o, h, bond=1)
+    g.charges[o] = -1
+    return g
+
+
+def make_proton():
+    g = GraphNode()
+    h = g.add_node("H")
+    g.charges[h] = +1
+    return g
+
+
+class ReactionSystem:
+    def __init__(self, molecules=[]):
+        self.molecules = molecules
+        self.history = []
+
+    def react(self, conditions=None):
+        if (
+            len(self.molecules) == 2
+            and len(self.molecules[0].ions) == 2
+            and len(self.molecules[0].ions) == 2
+        ):
+            s = []
+            for i in range(2):
+                for j in range(2):
+                    for k in range(2):
+                        if (
+                            make_hydroxide() == self.molecules[i].ions[j]
+                            and make_proton() == self.molecules[1 - i].ions[k]
+                        ):
+                            s = [
+                                self.molecules[i].ions[1 - j],
+                                self.molecules[1 - i].ions[1 - k],
+                            ]
+                            break
+                if s != []:
+                    break
+            if s != []:
+                self.history.append(copy.deepcopy(self))
+                self.molecules = [Molecule(s), molec("O")]
+                return
+        if hydrogen_molecule() in self.molecules:
+            if Molecule([add_hydrogens(smiles("O=O"))]) in self.molecules:
+                self.history.append(copy.deepcopy(self))
+                self.molecules = [Molecule([add_hydrogens(smiles("O"))])]
+                return
+
+    def show(self, molecularfx=True):
+        s2 = []
+        lst = self.history + [copy.deepcopy(self)]
+        for i in range(len(lst) - 1):
+            s = []
+            c = balance(
+                *[
+                    [molecular_formula(item.ions) for item in lst[i + j].molecules]
+                    for j in range(2)
+                ]
+            )
+            for item in lst[i : i + 2]:
+                s.append(
+                    " + ".join(
+                        [
+                            str(c.pop(0))
+                            + " "
+                            + (str(item) if molecularfx else item.full_struct())
+                            for item in item.molecules
+                        ]
+                    )
+                )
+            s2.append(" --> ".join(s).replace("1 ", ""))
+        return "\n".join(s2)
+
+    def __repr__(self):
+        return self.show(False)
+
+
+def molec(a, b=None):
+    lst = []
+    lst2 = [a, b]
+    if b is None:
+        lst2.pop(-1)
+    for item in lst2:
+        if item == "hydroxide":
+            lst.append(make_hydroxide())
+        elif item == "proton":
+            lst.append(make_proton())
+        else:
+            lst.append(add_hydrogens(smiles(item)))
+    return Molecule(lst)
+
+
+def rxn_system(lst):
+    return ReactionSystem(lst)

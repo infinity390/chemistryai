@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="chemistryai",
-    version="0.2.1",
+    version="0.2.2",
     packages=find_packages(),
     install_requires=[
         "rdkit==2025.9.3",
